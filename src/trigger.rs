@@ -47,7 +47,7 @@ impl TaskId {
 struct Task {
   schedule: BoundSchedule,
   expr: Box<str>,
-  callback: Box<dyn FnMut() -> BoxTaskFuture + Send + 'static>,
+  callback: Box<dyn FnMut(Timestamp) -> BoxTaskFuture + Send + 'static>,
   running: Arc<AtomicBool>,
   next: Option<Timestamp>,
 }
@@ -107,24 +107,32 @@ impl fmt::Debug for TaskRun {
 ///
 /// ```text
 /// let mut trigger = Trigger::new();
-/// trigger.register("{*}-{*}-{*}T00:00:00", || async { /* ... */ })?;
+/// trigger.register("{*}-{*}-{*}T00:00:00", |scheduled_at| async move {
+///     // scheduled_at is the nominal trigger time
+/// })?;
 ///
 /// loop {
-///     let Some(at) = trigger.next(Timestamp::now()) else { break };
-///     sleep_until(at).await;              // tokio::time, smol::Timer, ...
-///     for run in trigger.fire_due(Timestamp::now()) {
-///         runtime_spawn(run);             // tokio::spawn, smol::spawn, ...
+///     let now = Timestamp::now();
+///     let Some(scheduled_at) = trigger.next(now) else { break };
+///     if scheduled_at > now {
+///         sleep_until(scheduled_at).await;  // tokio::time, smol::Timer, ...
+///     }
+///     let started_at = Timestamp::now();
+///     for run in trigger.fire_due(scheduled_at, started_at) {
+///         runtime_spawn(run);               // tokio::spawn, smol::spawn, ...
 ///     }
 /// }
 /// ```
 ///
 /// Overlap policy: if a task's previous run is still in flight when its next
-/// tick fires, the tick is skipped (and logged at `WARN`). Missed ticks
-/// (e.g. the runtime slept past them) fire once — there is no catch-up.
+/// tick fires, the tick is skipped (and logged at `WARN`).
 ///
-/// [`Trigger::next`] may return an instant that is already in the past when
-/// the caller is late; [`Trigger::fire_due`] advances the task and fires that
-/// overdue tick once.
+/// Missed-tick policy: a tick that is already stale when the scheduler
+/// dispatches is skipped, not replayed. [`Trigger::next`] may return an
+/// instant that is already in the past when the caller is late;
+/// [`Trigger::fire_due`] skips it and advances the task past the dispatch
+/// start time. Each run receives the nominal trigger time; the callback can
+/// call [`Timestamp::now`] for the actual execution time.
 #[derive(Default)]
 pub struct Trigger {
   /// One slot per (possibly reused) task position. The generation is bumped
@@ -160,7 +168,7 @@ impl Trigger {
   /// performs the actual work once spawned onto the host runtime.
   pub fn register<F, Fut>(&mut self, schedule: &str, callback: F) -> Result<TaskId, RegisterError>
   where
-    F: FnMut() -> Fut + Send + 'static,
+    F: FnMut(Timestamp) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
   {
     let parsed: Schedule = schedule.parse()?;
@@ -172,7 +180,7 @@ impl Trigger {
     &mut self, schedule: Schedule, callback: F,
   ) -> Result<TaskId, RegisterError>
   where
-    F: FnMut() -> Fut + Send + 'static,
+    F: FnMut(Timestamp) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
   {
     self.register_schedule_with_expr(schedule, "<unnamed>", callback)
@@ -182,14 +190,14 @@ impl Trigger {
     &mut self, schedule: Schedule, expr: &str, mut callback: F,
   ) -> Result<TaskId, RegisterError>
   where
-    F: FnMut() -> Fut + Send + 'static,
+    F: FnMut(Timestamp) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
   {
     let bound = schedule.bind()?;
     let task = Task {
       schedule: bound,
       expr: expr.into(),
-      callback: Box::new(move || Box::pin(callback()) as BoxTaskFuture),
+      callback: Box::new(move |scheduled_at| Box::pin(callback(scheduled_at)) as BoxTaskFuture),
       running: Arc::new(AtomicBool::new(false)),
       next: None,
     };
@@ -248,8 +256,8 @@ impl Trigger {
   /// Computes each task's next occurrence lazily on first use. The returned
   /// instant may already be in the past if the caller is late; this method
   /// never fires anything and never advances past a pending tick.
-  /// [`Trigger::fire_due`] is the only place a run is produced, and it
-  /// collapses all elapsed ticks into a single fire.
+  /// [`Trigger::fire_due`] is the only place a run is produced; it skips
+  /// stale ticks instead of replaying them.
   pub fn next(&mut self, now: Timestamp) -> Option<Timestamp> {
     let mut soonest = None;
     for slot in &mut self.tasks {
@@ -265,34 +273,85 @@ impl Trigger {
     soonest
   }
 
-  /// Fires every task due at `now` and returns the pending runs.
+  /// Fires the tick scheduled for `scheduled_at` and returns the pending runs.
   ///
-  /// Each due task's next occurrence is recomputed from `now` (missed
-  /// intermediate ticks are skipped, not replayed). A task whose previous
-  /// run is still in flight is skipped and logged at `WARN`.
-  pub fn fire_due(&mut self, now: Timestamp) -> Vec<TaskRun> {
+  /// `scheduled_at` must be the instant returned by [`Trigger::next`] for this
+  /// dispatch round. `started_at` is the dispatch start time, captured once by
+  /// the scheduler and used only for staleness checks and advancing tasks.
+  /// Every callback receives the nominal trigger time.
+  ///
+  /// Only the tick at `scheduled_at` may fire. A task whose pending tick is
+  /// older, or whose next occurrence is already due at `started_at`, is
+  /// skipped and advanced past `started_at`: missed ticks are not replayed.
+  /// A task whose previous run is still in flight is skipped and logged at
+  /// `WARN`.
+  pub fn fire_due(&mut self, scheduled_at: Timestamp, started_at: Timestamp) -> Vec<TaskRun> {
     let mut runs = Vec::new();
     for (index, slot) in self.tasks.iter_mut().enumerate() {
       let generation = slot.generation;
       let Some(task) = &mut slot.task else { continue };
-      // Compute the pending instant lazily on first use. `next` may already
-      // have done this; either way, only elapsed ticks are fired.
+      // Compute the pending instant lazily on first use. A task registered
+      // after `next` ran starts from the dispatch time, so it is never
+      // overdue in this round.
       if task.next.is_none() {
-        task.next = task.schedule.next_after(now).map(|zoned| zoned.timestamp());
+        task.next = task
+          .schedule
+          .next_after(started_at)
+          .map(|zoned| zoned.timestamp());
       }
       let Some(at) = task.next else { continue };
-      if at > now {
+      if at > started_at {
         continue;
       }
-      // Advance past `now` so a later `fire_due` does not re-fire this tick.
-      // Missed intermediate ticks are collapsed, not replayed.
-      task.next = task.schedule.next_after(now).map(|zoned| zoned.timestamp());
+
+      // Only the tick the scheduler actually waited for may fire. Any other
+      // tick at or before `started_at` is either older or came due during
+      // the dispatch delay; skip it without replaying it.
+      let next_after_at = if at == scheduled_at {
+        task.schedule.next_after(at).map(|zoned| zoned.timestamp())
+      } else {
+        None
+      };
+      let stale = matches!(next_after_at, Some(next) if next <= started_at);
+      if at != scheduled_at || stale {
+        task.next = task
+          .schedule
+          .next_after(started_at)
+          .map(|zoned| zoned.timestamp());
+        debug!(
+          task_id = index,
+          generation,
+          schedule = &*task.expr,
+          at = %at,
+          started_at = %started_at,
+          "task skipped: missed tick"
+        );
+        continue;
+      }
+
+      // Advance past the dispatched tick. The next occurrence is strictly
+      // after `started_at`, so intermediate missed ticks are not replayed.
+      task.next = next_after_at;
       if task.running.swap(true, Ordering::AcqRel) {
-        warn!(task_id = index, generation, schedule = &*task.expr, at = %at, "task skipped: previous run still in flight");
+        warn!(
+          task_id = index,
+          generation,
+          schedule = &*task.expr,
+          at = %at,
+          "task skipped: previous run still in flight"
+        );
         continue;
       }
-      info!(task_id = index, generation, schedule = &*task.expr, at = %at, "task triggered");
-      let future = (task.callback)();
+      info!(
+        task_id = index,
+        generation,
+        schedule = &*task.expr,
+        scheduled_at = %at,
+        started_at = %started_at,
+        delay = %started_at.duration_since(at),
+        "task triggered"
+      );
+      let future = (task.callback)(at);
       runs.push(TaskRun {
         id: TaskId { index, generation },
         running: Arc::clone(&task.running),

@@ -31,3 +31,4 @@ jobs:
       - run: cargo check --no-default-features --features alloc --locked
       - run: cargo check --no-default-features --features bundle-tzdb --locked
       - run: cargo check --no-default-features --features tzdb-platform --locked
+      - run: cargo check --no-default-features --features cli --locked
