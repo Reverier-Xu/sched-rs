@@ -1,13 +1,13 @@
 [package]
-name        = "schedd"
+name        = "sched-cli"
 version     = "0.1.0"
 edition     = "2024"
-license     = "MIT or Apache-2.0"
+license     = "MIT OR Apache-2.0"
 description = "A cron-style daemon built on the sched library"
 publish     = false
 
 [[bin]]
-name = "schedd"
+name = "sched"
 path = "src/main.rs"
 
 [dependencies]

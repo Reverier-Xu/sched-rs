@@ -1,12 +1,12 @@
-//! schedd — a cron-style daemon built on the `sched` library.
+//! The `sched` daemon — a cron-style daemon built on the `sched` library.
 //!
 //! Reads a schedtab file and runs each entry's command via bash at its
 //! scheduled times. Logs are written to stdout as structured records; under
 //! systemd, stdout is captured into the journal automatically
-//! (`journalctl -u schedd`). Set `SCHEDD_LOG` (or `RUST_LOG`) to control
-//! verbosity, e.g. `SCHEDD_LOG=debug`.
+//! (`journalctl -u sched`). Set `SCHED_LOG` (or `RUST_LOG`) to control
+//! verbosity, e.g. `SCHED_LOG=debug`.
 //!
-//! Usage: `schedd [--check] [path-to-schedtab]`
+//! Usage: `sched [--check] [path-to-schedtab]`
 //!
 //! schedtab format (crontab-style): one entry per line, `#` starts a
 //! comment, the first whitespace run outside braces separates the schedule
@@ -50,6 +50,9 @@ fn main() -> ExitCode {
     Ok((trigger, errors)) if check_only => {
       if errors > 0 {
         error!(errors, "schedtab has invalid entries");
+        ExitCode::FAILURE
+      } else if trigger.is_empty() {
+        error!(path = %path.display(), "schedtab has no valid entries");
         ExitCode::FAILURE
       } else {
         info!(tasks = trigger.len(), path = %path.display(), "schedtab ok");
@@ -159,7 +162,7 @@ async fn run_command(command: String) {
 /// The drive loop: sleep until the soonest trigger time, then spawn every
 /// due run onto the smol executor.
 async fn drive(mut trigger: Trigger) {
-  info!(tasks = trigger.len(), "schedd started");
+  info!(tasks = trigger.len(), "sched started");
   loop {
     let now = Timestamp::now();
     let Some(at) = trigger.next(now) else {
