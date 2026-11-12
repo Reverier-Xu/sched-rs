@@ -42,10 +42,12 @@
 //!   occurrence; if that instant is not strictly after the query time, the
 //!   match is skipped. Gaps are skipped.
 //! - `Trigger` is a runtime-agnostic task table: register async callbacks,
-//!   then drive it from any executor — sleep until `Trigger::next`, call
-//!   `Trigger::fire_due`, and spawn the returned `TaskRun` futures.
-//!   `next` may return an overdue instant; `fire_due` catches it up once. A
-//!   tick whose previous run is still in flight is skipped.
+//!   then drive it from any executor — sleep until `Trigger::next`, capture
+//!   the dispatch start time, call `Trigger::fire_due`, and spawn the
+//!   returned `TaskRun` futures. A stale tick is skipped, not replayed; each
+//!   run receives the nominal trigger time, and the callback can call
+//!   `Timestamp::now()` for the actual execution time. A tick whose previous
+//!   run is still in flight is skipped.
 //!
 //! # Feature flags
 //!
@@ -55,6 +57,8 @@
 //! - `bundle-tzdb`: always use the bundled time zone database.
 //! - `tzdb-platform` (default): use the bundled time zone database only on
 //!   platforms without a system database (e.g. Windows).
+//! - `cli`: build the `sched` daemon binary (non-default; implies `std` and
+//!   `tzdb-platform`).
 
 #[cfg(feature = "alloc")]
 extern crate alloc;

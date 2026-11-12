@@ -2,8 +2,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use sched::{
@@ -215,10 +215,12 @@ fn bind_errors() {
 fn trigger_register_errors() {
   init_logs();
   let mut trigger = Trigger::new();
-  let err = trigger.register("not a schedule", || async {}).unwrap_err();
+  let err = trigger
+    .register("not a schedule", |_| async {})
+    .unwrap_err();
   assert!(matches!(err, RegisterError::Parse(_)));
   let err = trigger
-    .register("{*}-{*}-{*}T00:00:00[Not/AZone]", || async {})
+    .register("{*}-{*}-{*}T00:00:00[Not/AZone]", |_| async {})
     .unwrap_err();
   assert!(matches!(err, RegisterError::Bind(_)));
 }
@@ -230,7 +232,7 @@ fn trigger_fires_due_tasks_once_per_tick() {
   let mut trigger = Trigger::new();
   let counter2 = Arc::clone(&counter);
   trigger
-    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", move || {
+    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", move |_| {
       let counter = Arc::clone(&counter2);
       async move {
         counter.fetch_add(1, Ordering::Relaxed);
@@ -241,21 +243,21 @@ fn trigger_fires_due_tasks_once_per_tick() {
   let t0 = ts("2026-01-01T00:00:00Z");
   // First next() establishes the baseline: next tick is t0 + 1s.
   assert_eq!(trigger.next(t0), Some(ts("2026-01-01T00:00:01Z")));
-  // Not yet due.
-  assert!(trigger.fire_due(t0).is_empty());
+  // Not yet due: the dispatch started before the scheduled tick.
+  assert!(trigger.fire_due(ts("2026-01-01T00:00:01Z"), t0).is_empty());
   // Due: the run is produced, and the async work happens when polled.
-  let mut runs = trigger.fire_due(ts("2026-01-01T00:00:01Z"));
+  let mut runs = trigger.fire_due(ts("2026-01-01T00:00:01Z"), ts("2026-01-01T00:00:01Z"));
   assert_eq!(runs.len(), 1);
   assert_eq!(counter.load(Ordering::Relaxed), 0);
   assert!(poll_once(Pin::new(&mut runs[0])).is_ready());
   assert_eq!(counter.load(Ordering::Relaxed), 1);
 
-  // Missed ticks fire once, with no catch-up burst. Polling `next` first must
-  // not swallow the overdue tick.
+  // Missed ticks are skipped, not replayed: a late dispatch produces no run.
   let late = ts("2026-01-01T00:01:30Z");
   assert_eq!(trigger.next(late), Some(ts("2026-01-01T00:00:02Z")));
-  let runs = trigger.fire_due(late);
-  assert_eq!(runs.len(), 1);
+  let runs = trigger.fire_due(ts("2026-01-01T00:00:02Z"), late);
+  assert!(runs.is_empty());
+  assert_eq!(trigger.next(late), Some(ts("2026-01-01T00:01:31Z")));
 }
 
 #[test]
@@ -264,17 +266,19 @@ fn trigger_skips_overlapping_runs() {
   let mut trigger = Trigger::new();
   // The task runs forever once started.
   trigger
-    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", core::future::pending)
+    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", |_| {
+      core::future::pending::<()>()
+    })
     .unwrap();
 
   let t0 = ts("2026-01-01T00:00:00Z");
   trigger.next(t0);
-  let runs = trigger.fire_due(ts("2026-01-01T00:00:01Z"));
+  let runs = trigger.fire_due(ts("2026-01-01T00:00:01Z"), ts("2026-01-01T00:00:01Z"));
   assert_eq!(runs.len(), 1);
   std::mem::forget(runs.into_iter().next()); // keep the run alive (leak it)
 
   // The next tick fires while the previous run is still in flight: skipped.
-  let runs = trigger.fire_due(ts("2026-01-01T00:00:02Z"));
+  let runs = trigger.fire_due(ts("2026-01-01T00:00:02Z"), ts("2026-01-01T00:00:02Z"));
   assert!(runs.is_empty(), "overlapping run must be skipped");
 }
 
@@ -283,16 +287,18 @@ fn trigger_dropped_run_frees_the_slot() {
   init_logs();
   let mut trigger = Trigger::new();
   trigger
-    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", core::future::pending)
+    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", |_| {
+      core::future::pending::<()>()
+    })
     .unwrap();
 
   let t0 = ts("2026-01-01T00:00:00Z");
   trigger.next(t0);
-  let runs = trigger.fire_due(ts("2026-01-01T00:00:01Z"));
+  let runs = trigger.fire_due(ts("2026-01-01T00:00:01Z"), ts("2026-01-01T00:00:01Z"));
   assert_eq!(runs.len(), 1);
   drop(runs); // dropped without being polled: the in-flight flag is cleared
 
-  let runs = trigger.fire_due(ts("2026-01-01T00:00:02Z"));
+  let runs = trigger.fire_due(ts("2026-01-01T00:00:02Z"), ts("2026-01-01T00:00:02Z"));
   assert_eq!(runs.len(), 1);
 }
 
@@ -301,7 +307,7 @@ fn trigger_deregister() {
   init_logs();
   let mut trigger = Trigger::new();
   let id = trigger
-    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", || async {})
+    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", |_| async {})
     .unwrap();
   assert_eq!(trigger.len(), 1);
   assert!(trigger.deregister(id));
@@ -315,10 +321,10 @@ fn trigger_next_picks_the_soonest() {
   init_logs();
   let mut trigger = Trigger::new();
   trigger
-    .register("{*}-{*}-{*}T{*}:0:0Z", || async {})
+    .register("{*}-{*}-{*}T{*}:0:0Z", |_| async {})
     .unwrap();
   trigger
-    .register("{*}-{*}-{*}T{*}:{*}:{30}Z", || async {})
+    .register("{*}-{*}-{*}T{*}:{*}:{30}Z", |_| async {})
     .unwrap();
   assert_eq!(
     trigger.next(ts("2026-01-01T00:00:00Z")),
@@ -460,10 +466,10 @@ fn huge_offsets_are_rejected_at_parse_time() {
 fn stale_task_id_does_not_deregister_reused_slot() {
   let mut trigger = Trigger::new();
   let a = trigger
-    .register("{*}-{*}-{*}T00:00:00Z", || async {})
+    .register("{*}-{*}-{*}T00:00:00Z", |_| async {})
     .unwrap();
   let b = trigger
-    .register("{*}-{*}-{*}T00:00:00Z", || async {})
+    .register("{*}-{*}-{*}T00:00:00Z", |_| async {})
     .unwrap();
   assert_eq!(trigger.len(), 2);
 
@@ -472,7 +478,7 @@ fn stale_task_id_does_not_deregister_reused_slot() {
 
   // Registering again reuses `a`'s slot, with a fresh generation.
   let c = trigger
-    .register("{*}-{*}-{*}T00:00:00Z", || async {})
+    .register("{*}-{*}-{*}T00:00:00Z", |_| async {})
     .unwrap();
   assert_eq!(c.index(), a.index(), "slot should be reused");
   assert_ne!(c.generation(), a.generation(), "generation must advance");
@@ -490,14 +496,15 @@ fn stale_task_id_does_not_deregister_reused_slot() {
 }
 
 // ---------------------------------------------------------------------------
-// Regression: `next` must not swallow an overdue tick
+// Regression: `next` must not swallow an overdue tick, but `fire_due` must
+// skip it rather than replaying it
 // ---------------------------------------------------------------------------
 
 #[test]
-fn next_may_report_overdue_and_fire_due_catches_up() {
+fn next_may_report_overdue_and_fire_due_skips_it() {
   let mut trigger = Trigger::new();
   trigger
-    .register("{*}-{*}-{*}T{*}:00:00Z", || async {})
+    .register("{*}-{*}-{*}T{*}:00:00Z", |_| async {})
     .unwrap();
 
   let first = trigger.next(ts("2026-01-01T00:00:00Z")).unwrap();
@@ -508,8 +515,8 @@ fn next_may_report_overdue_and_fire_due_catches_up() {
   let late = ts("2026-06-01T00:00:00Z");
   assert_eq!(trigger.next(late), Some(ts("2026-01-01T01:00:00Z")));
 
-  // `fire_due` fires the overdue tick once and advances from `late`.
-  assert_eq!(trigger.fire_due(late).len(), 1);
+  // The tick is stale by dispatch time: it is skipped, not replayed.
+  assert!(trigger.fire_due(first, late).is_empty());
   assert_eq!(trigger.next(late), Some(ts("2026-06-01T01:00:00Z")));
 }
 
@@ -517,7 +524,7 @@ fn next_may_report_overdue_and_fire_due_catches_up() {
 fn next_at_exact_tick_does_not_skip_it() {
   let mut trigger = Trigger::new();
   trigger
-    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", || async {})
+    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", |_| async {})
     .unwrap();
 
   let t0 = ts("2026-01-01T00:00:00Z");
@@ -527,5 +534,58 @@ fn next_at_exact_tick_does_not_skip_it() {
     trigger.next(ts("2026-01-01T00:00:01Z")),
     Some(ts("2026-01-01T00:00:01Z"))
   );
-  assert_eq!(trigger.fire_due(ts("2026-01-01T00:00:01Z")).len(), 1);
+  assert_eq!(
+    trigger
+      .fire_due(ts("2026-01-01T00:00:01Z"), ts("2026-01-01T00:00:01Z"))
+      .len(),
+    1
+  );
+}
+
+#[test]
+fn callback_receives_the_nominal_trigger_time() {
+  let seen = Arc::new(Mutex::new(None));
+  let seen2 = Arc::clone(&seen);
+  let mut trigger = Trigger::new();
+  trigger
+    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", move |scheduled_at| {
+      let seen = Arc::clone(&seen2);
+      async move {
+        *seen.lock().unwrap() = Some(scheduled_at);
+      }
+    })
+    .unwrap();
+
+  let t0 = ts("2026-01-01T00:00:00Z");
+  let scheduled = trigger.next(t0).unwrap();
+  // The dispatch is 500ms late, but the callback still receives the nominal
+  // trigger time, not the dispatch start time.
+  let started = ts("2026-01-01T00:00:01.500Z");
+  let mut runs = trigger.fire_due(scheduled, started);
+  assert_eq!(runs.len(), 1);
+  assert!(poll_once(Pin::new(&mut runs[0])).is_ready());
+
+  let seen = seen.lock().unwrap().expect("callback must run");
+  assert_eq!(seen, scheduled);
+}
+
+#[test]
+fn ticks_that_come_due_during_the_delay_are_skipped() {
+  let mut trigger = Trigger::new();
+  trigger
+    .register("{*}-{*}-{*}T{*}:{*}:{*}Z", |_| async {})
+    .unwrap();
+  trigger
+    .register("{*}-{*}-{*}T{*}:{*}:02Z", |_| async {})
+    .unwrap();
+
+  let t0 = ts("2026-01-01T00:00:00Z");
+  let scheduled = trigger.next(t0).unwrap();
+  assert_eq!(scheduled, ts("2026-01-01T00:00:01Z"));
+
+  // The scheduler wakes at 02.5s. The 01s tick is stale, and the 02s tick
+  // came due during the delay; neither is replayed.
+  let started = ts("2026-01-01T00:00:02.500Z");
+  assert!(trigger.fire_due(scheduled, started).is_empty());
+  assert_eq!(trigger.next(started), Some(ts("2026-01-01T00:00:03Z")));
 }

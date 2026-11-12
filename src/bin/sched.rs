@@ -1,10 +1,16 @@
 //! The `sched` daemon — a cron-style daemon built on the `sched` library.
 //!
+//! This binary is built with the non-default `cli` feature:
+//!
+//! ```text
+//! cargo run --features cli --bin sched -- [--check] [path-to-schedtab]
+//! ```
+//!
 //! Reads a schedtab file and runs each entry's command via bash at its
 //! scheduled times. Logs are written to stdout as structured records; under
 //! systemd, stdout is captured into the journal automatically
-//! (`journalctl -u sched`). Set `SCHED_LOG` (or `RUST_LOG`) to control
-//! verbosity, e.g. `SCHED_LOG=debug`.
+//! (`journalctl -u sched`). Set `SCHEDD_LOG` (or `RUST_LOG`) to control
+//! verbosity, e.g. `SCHEDD_LOG=debug`.
 //!
 //! Usage: `sched [--check] [path-to-schedtab]`
 //!
@@ -16,6 +22,13 @@
 //! {*}-{*}-{*}T08:00:00[Asia/Shanghai]   echo "good morning"
 //! 2026-{*}-{*}T{8, 12-14}:00:00+08:00   /usr/local/bin/backup.sh
 //! ```
+//!
+//! Each command receives `SCHED_SCHEDULED_AT` (the nominal trigger time) in
+//! its environment. The command can get its actual execution time itself
+//! (e.g. with `date`), which is the other quantity a scheduled task usually
+//! cares about.
+
+#![forbid(unsafe_code)]
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -102,9 +115,9 @@ fn load(path: &Path) -> io::Result<(Trigger, usize)> {
     };
     let command = command.to_string();
     let command_for_log = command.clone();
-    match trigger.register(expr, move || {
+    match trigger.register(expr, move |scheduled_at| {
       let command = command.clone();
-      async move { run_command(command).await }
+      async move { run_command(command, scheduled_at).await }
     }) {
       Ok(id) => info!(task_id = id.index(), %expr, command = %command_for_log, "task scheduled"),
       Err(error) => {
@@ -136,11 +149,20 @@ fn split_entry(line: &str) -> Option<(&str, &str)> {
 }
 
 /// Executes a command via bash, logging its output line by line.
-async fn run_command(command: String) {
+///
+/// The nominal trigger time is exposed as `SCHED_SCHEDULED_AT`; the command
+/// can get its actual execution time itself.
+async fn run_command(command: String, scheduled_at: Timestamp) {
+  info!(
+    command = %command,
+    scheduled_at = %scheduled_at,
+    "command started"
+  );
   let result = async_process::Command::new("bash")
     .arg("-c")
     .arg(&command)
     .stdin(std::process::Stdio::null())
+    .env("SCHED_SCHEDULED_AT", scheduled_at.to_string())
     .output()
     .await;
   match result {
@@ -161,18 +183,31 @@ async fn run_command(command: String) {
 
 /// The drive loop: sleep until the soonest trigger time, then spawn every
 /// due run onto the smol executor.
+///
+/// The dispatch start time is captured exactly once per round and passed to
+/// `fire_due`, so every callback and command sees the same instant.
 async fn drive(mut trigger: Trigger) {
   info!(tasks = trigger.len(), "sched started");
+  let mut running: Vec<smol::Task<()>> = Vec::new();
   loop {
-    let now = Timestamp::now();
-    let Some(at) = trigger.next(now) else {
+    let decision_time = Timestamp::now();
+    let Some(scheduled_at) = trigger.next(decision_time) else {
+      // No future ticks: let in-flight commands finish before exiting.
+      for task in running {
+        task.await;
+      }
       info!("no task will fire again; exiting");
       return;
     };
-    smol::Timer::after(duration_between(now, at)).await;
-    for run in trigger.fire_due(Timestamp::now()) {
-      smol::spawn(run).detach();
+    if scheduled_at > decision_time {
+      smol::Timer::after(duration_between(decision_time, scheduled_at)).await;
     }
+    let started_at = Timestamp::now();
+    for run in trigger.fire_due(scheduled_at, started_at) {
+      running.push(smol::spawn(run));
+    }
+    // Reap completed runs so the handle list does not grow forever.
+    running.retain(|task| !task.is_finished());
   }
 }
 

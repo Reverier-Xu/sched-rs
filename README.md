@@ -51,14 +51,20 @@ spawns them.
 use sched::{Timestamp, Trigger};
 
 let mut trigger = Trigger::new();
-trigger.register("{*}-{*}-{*}T08:00:00", || async {
-  // do work
+trigger.register("{*}-{*}-{*}T08:00:00", |scheduled_at| async move {
+  // scheduled_at: the nominal trigger time
+  // Timestamp::now(): the actual execution time
+  let _ = scheduled_at;
 })?;
 
 loop {
-  let Some(at) = trigger.next(Timestamp::now()) else { break };
-  sleep_until(at).await;
-  for run in trigger.fire_due(Timestamp::now()) {
+  let now = Timestamp::now();
+  let Some(scheduled_at) = trigger.next(now) else { break };
+  if scheduled_at > now {
+    sleep_until(scheduled_at).await;
+  }
+  let started_at = Timestamp::now();
+  for run in trigger.fire_due(scheduled_at, started_at) {
     spawn(run);
   }
 }
@@ -66,8 +72,11 @@ loop {
 ```
 
 `next` may return an instant that is already in the past if the runtime was
-late; `fire_due` advances the task and fires that overdue tick once. A tick
-whose previous run is still in flight is skipped.
+late. `fire_due` only fires the tick the scheduler actually waited for; a
+tick that is already stale by dispatch time is skipped, never replayed. Each
+run receives the nominal trigger time; the task can call `Timestamp::now()`
+for its actual execution time. A tick whose previous run is still in flight
+is skipped.
 
 ## Features
 
@@ -77,6 +86,7 @@ whose previous run is still in flight is skipped.
 | `alloc` | Time zone binding and `Trigger` in `no_std + alloc` environments. |
 | `bundle-tzdb` | Always use the bundled time zone database. |
 | `tzdb-platform` (default) | Use the bundled database only where the platform has none. |
+| `cli` | Build the `sched` daemon binary. Not enabled by default; implies `std` and `tzdb-platform`. |
 
 For an embedded `no_std + alloc` target without a system time zone database:
 
@@ -89,8 +99,8 @@ The civil-only API (`Schedule::next_after`) works with no features at all.
 
 ## `sched` daemon
 
-`crates/sched-cli` builds the `sched` binary, a small daemon that reads a
-crontab-style file and runs commands through `bash -c`:
+The non-default `cli` feature builds the `sched` binary, a small daemon that
+reads a crontab-style file and runs commands through `bash -c`:
 
 ```text
 {*}-{*}-{*}T08:00:00[Asia/Shanghai]   echo "good morning"
@@ -99,7 +109,12 @@ crontab-style file and runs commands through `bash -c`:
 
 Run `sched [--check] [path-to-schedtab]`; the default path is
 `/etc/sched/schedtab`. From the workspace, use
-`cargo run -p sched-cli --bin sched -- --check examples/schedtab`.
+`cargo run --features cli --bin sched -- --check examples/schedtab`, or
+install it with `cargo install sched --features cli`.
+
+Each command receives `SCHED_SCHEDULED_AT` (the nominal trigger time) in its
+environment. The command can get its actual execution time itself, e.g. with
+`date`.
 
 ## Development
 
