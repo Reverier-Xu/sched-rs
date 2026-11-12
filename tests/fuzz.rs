@@ -114,7 +114,7 @@ fn brace(rng: &mut Rng, max: u32) -> String {
 
 fn structured(rng: &mut Rng) -> String {
   // Small values keep outputs valid; occasional large ones probe the
-  // lazy-validation and storage-limit paths.
+  // field-domain and range-validation paths.
   let field_max = if rng.chance(10) { 100_000 } else { 130 };
   let field = |rng: &mut Rng| {
     if rng.chance(40) {

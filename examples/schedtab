@@ -1,4 +1,4 @@
-# schedtab — schedd demo table.
+# schedtab — sched demo table.
 #
 # One entry per line: `<schedule expression> <command>`. `#` starts a
 # comment. The command runs via `bash -c`. All entries below fire within

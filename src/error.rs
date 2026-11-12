@@ -2,14 +2,12 @@
 
 /// An error that occurred while parsing a schedule expression.
 ///
-/// sched is deliberately lazy about validity: anything that can never match
-/// a real date-time simply parses and never triggers — a month of `13`, an
-/// inverted range like `{14-8}` (expanding to an empty set), an offset of
-/// `+99:00`. Expressions are short and declarative, so mistakes are visible
-/// at a glance rather than reported eagerly. Malformed syntax is the only
-/// parse error.
+/// Parsing validates syntax, field domains, ranges, and fixed offsets. A
+/// month of `13`, an inverted range like `{14-8}`, and an offset of `+99:00`
+/// are all parse errors. Calendar validity (February 30th, leap days) is
+/// checked later, when trigger times are computed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
-#[error("invalid schedule syntax at byte offset {offset}")]
+#[error("invalid schedule at byte offset {offset}")]
 pub struct ParseError {
   /// Byte offset at which the parser gave up.
   pub offset: usize,

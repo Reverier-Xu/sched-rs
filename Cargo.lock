@@ -791,7 +791,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "schedd"
+name = "sched-cli"
 version = "0.1.0"
 dependencies = [
  "async-process",

@@ -21,13 +21,26 @@ use crate::schedule::Schedule;
 type BoxTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// A registered task's handle.
+///
+/// Carries a generation counter alongside the slot index so that a stale id
+/// (from a deregistered task whose slot was reused) can never address the
+/// new occupant of that slot. [`Trigger::deregister`] compares both parts.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct TaskId(usize);
+pub struct TaskId {
+  index: usize,
+  generation: u32,
+}
 
 impl TaskId {
   /// The task's slot index.
   pub fn index(self) -> usize {
-    self.0
+    self.index
+  }
+
+  /// The slot generation this id was issued for. Not part of the stable API
+  /// surface beyond equality comparisons; exposed for diagnostics.
+  pub fn generation(self) -> u32 {
+    self.generation
   }
 }
 
@@ -65,7 +78,7 @@ impl Future for TaskRun {
     match self.future.as_mut().poll(cx) {
       Poll::Ready(()) => {
         self.running.store(false, Ordering::Release);
-        trace!(task_id = self.id.0, "task run finished");
+        trace!(task_id = self.id.index, "task run finished");
         Poll::Ready(())
       }
       Poll::Pending => Poll::Pending,
@@ -108,9 +121,21 @@ impl fmt::Debug for TaskRun {
 /// Overlap policy: if a task's previous run is still in flight when its next
 /// tick fires, the tick is skipped (and logged at `WARN`). Missed ticks
 /// (e.g. the runtime slept past them) fire once — there is no catch-up.
+///
+/// [`Trigger::next`] may return an instant that is already in the past when
+/// the caller is late; [`Trigger::fire_due`] advances the task and fires that
+/// overdue tick once.
 #[derive(Default)]
 pub struct Trigger {
-  tasks: Vec<Option<Task>>,
+  /// One slot per (possibly reused) task position. The generation is bumped
+  /// on every reuse so stale [`TaskId`]s stop matching.
+  tasks: Vec<Slot>,
+}
+
+#[derive(Default)]
+struct Slot {
+  generation: u32,
+  task: Option<Task>,
 }
 
 impl Trigger {
@@ -121,12 +146,12 @@ impl Trigger {
 
   /// Number of registered tasks.
   pub fn len(&self) -> usize {
-    self.tasks.iter().flatten().count()
+    self.tasks.iter().filter(|slot| slot.task.is_some()).count()
   }
 
   /// Returns `true` if no tasks are registered.
   pub fn is_empty(&self) -> bool {
-    self.tasks.iter().all(Option::is_none)
+    self.tasks.iter().all(|slot| slot.task.is_none())
   }
 
   /// Parses and registers a schedule expression with an async callback.
@@ -168,26 +193,50 @@ impl Trigger {
       running: Arc::new(AtomicBool::new(false)),
       next: None,
     };
-    let id = match self.tasks.iter().position(Option::is_none) {
+    let id = match self.tasks.iter().position(|slot| slot.task.is_none()) {
       Some(index) => {
-        self.tasks[index] = Some(task);
-        TaskId(index)
+        let slot = &mut self.tasks[index];
+        // Bump on reuse so any id handed out for the previous occupant is
+        // stale from here on.
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.task = Some(task);
+        TaskId {
+          index,
+          generation: slot.generation,
+        }
       }
       None => {
-        self.tasks.push(Some(task));
-        TaskId(self.tasks.len() - 1)
+        let index = self.tasks.len();
+        self.tasks.push(Slot {
+          generation: 0,
+          task: Some(task),
+        });
+        TaskId {
+          index,
+          generation: 0,
+        }
       }
     };
-    debug!(task_id = id.0, schedule = expr, "task registered");
+    debug!(
+      task_id = id.index,
+      generation = id.generation,
+      schedule = expr,
+      "task registered"
+    );
     Ok(id)
   }
 
-  /// Removes a task. Returns `false` if the id is stale.
+  /// Removes a task. Returns `false` if the id is stale — either the slot is
+  /// empty, or it has since been reused by a different registration.
   pub fn deregister(&mut self, id: TaskId) -> bool {
-    match self.tasks.get_mut(id.0) {
-      Some(slot @ Some(_)) => {
-        *slot = None;
-        debug!(task_id = id.0, "task deregistered");
+    match self.tasks.get_mut(id.index) {
+      Some(slot) if slot.generation == id.generation && slot.task.is_some() => {
+        slot.task = None;
+        debug!(
+          task_id = id.index,
+          generation = id.generation,
+          "task deregistered"
+        );
         true
       }
       _ => false,
@@ -196,12 +245,15 @@ impl Trigger {
 
   /// The soonest pending trigger time, if any.
   ///
-  /// Computes each task's next occurrence lazily on the first call after
-  /// registration. Note this never revisits elapsed ticks: once a task's
-  /// cached time passes, only [`Trigger::fire_due`] fires and advances it.
+  /// Computes each task's next occurrence lazily on first use. The returned
+  /// instant may already be in the past if the caller is late; this method
+  /// never fires anything and never advances past a pending tick.
+  /// [`Trigger::fire_due`] is the only place a run is produced, and it
+  /// collapses all elapsed ticks into a single fire.
   pub fn next(&mut self, now: Timestamp) -> Option<Timestamp> {
     let mut soonest = None;
-    for task in self.tasks.iter_mut().flatten() {
+    for slot in &mut self.tasks {
+      let Some(task) = &mut slot.task else { continue };
       if task.next.is_none() {
         task.next = task.schedule.next_after(now).map(|zoned| zoned.timestamp());
         trace!(schedule = &*task.expr, next = ?task.next, "computed next occurrence");
@@ -221,7 +273,10 @@ impl Trigger {
   pub fn fire_due(&mut self, now: Timestamp) -> Vec<TaskRun> {
     let mut runs = Vec::new();
     for (index, slot) in self.tasks.iter_mut().enumerate() {
-      let Some(task) = slot else { continue };
+      let generation = slot.generation;
+      let Some(task) = &mut slot.task else { continue };
+      // Compute the pending instant lazily on first use. `next` may already
+      // have done this; either way, only elapsed ticks are fired.
       if task.next.is_none() {
         task.next = task.schedule.next_after(now).map(|zoned| zoned.timestamp());
       }
@@ -229,15 +284,17 @@ impl Trigger {
       if at > now {
         continue;
       }
+      // Advance past `now` so a later `fire_due` does not re-fire this tick.
+      // Missed intermediate ticks are collapsed, not replayed.
       task.next = task.schedule.next_after(now).map(|zoned| zoned.timestamp());
       if task.running.swap(true, Ordering::AcqRel) {
-        warn!(task_id = index, schedule = &*task.expr, at = %at, "task skipped: previous run still in flight");
+        warn!(task_id = index, generation, schedule = &*task.expr, at = %at, "task skipped: previous run still in flight");
         continue;
       }
-      info!(task_id = index, schedule = &*task.expr, at = %at, "task triggered");
+      info!(task_id = index, generation, schedule = &*task.expr, at = %at, "task triggered");
       let future = (task.callback)();
       runs.push(TaskRun {
-        id: TaskId(index),
+        id: TaskId { index, generation },
         running: Arc::clone(&task.running),
         future,
       });

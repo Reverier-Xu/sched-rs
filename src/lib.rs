@@ -1,4 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
 //! # sched
 //!
 //! A cron alternative using IANA-style schedule expressions:
@@ -21,23 +22,29 @@
 //!
 //! # Validation policy
 //!
-//! Parsing is lazy: anything that can never match a real date-time simply
-//! parses and never triggers — a month of `13`, February 30th, an inverted
-//! range like `{14-8}` (expanding to an empty set), an offset of `+99:00`.
-//! Malformed syntax is the only parse error; calendrical validity is jiff's
-//! job, enforced when computing trigger times.
+//! Parsing is strict: field values must be inside their calendrical domain
+//! (year `1..=9999`, month `1..=12`, day `1..=31`, hour `0..=23`, minute and
+//! second `0..=59`), ranges must be non-inverted, and a fixed offset must fit
+//! jiff's `-25:59..=+25:59` range. Anything else is a parse error.
+//!
+//! Calendar validity is checked when computing trigger times. A valid
+//! expression such as `{*}-02-30T00:00:00` parses but never fires because
+//! February 30th does not exist.
 //!
 //! # Computing trigger times
 //!
 //! - [`Schedule::next_after`] matches civil date-times (no time zone), and
 //!   works without an allocator. A schedule that declares a time zone is an
 //!   error here — bind it first.
-//! - With `alloc`, [`Schedule::bind`] resolves the zone declaration into a
-//!   [`BoundSchedule`], whose `next_after` returns absolute [`Zoned`] times.
-//!   DST gaps are skipped; folds fire once (at the first occurrence).
-//! - [`Trigger`] is a runtime-agnostic task table: register async callbacks,
-//!   then drive it from any executor — sleep until [`Trigger::next`], call
-//!   [`Trigger::fire_due`], and spawn the returned [`TaskRun`] futures. A
+//! - With `alloc`, `Schedule::bind` resolves the zone declaration into a
+//!   `BoundSchedule`, whose `next_after` returns absolute `Zoned` times.
+//!   Each civil match fires at most once, at its earliest absolute
+//!   occurrence; if that instant is not strictly after the query time, the
+//!   match is skipped. Gaps are skipped.
+//! - `Trigger` is a runtime-agnostic task table: register async callbacks,
+//!   then drive it from any executor — sleep until `Trigger::next`, call
+//!   `Trigger::fire_due`, and spawn the returned `TaskRun` futures.
+//!   `next` may return an overdue instant; `fire_due` catches it up once. A
 //!   tick whose previous run is still in flight is skipped.
 //!
 //! # Feature flags
@@ -64,12 +71,10 @@ mod trigger;
 use core::str::FromStr;
 
 pub use error::{ParseError, TriggerError};
+pub use jiff::Timestamp;
 pub use jiff::civil::DateTime;
-pub use jiff::{SignedDuration, Timestamp};
 pub use parser::parse;
-pub use schedule::{
-  FieldSet, FieldSetIter, FixedOffset, IanaName, MAX_TZ_NAME_LEN, Schedule, ZoneSpec,
-};
+pub use schedule::{FieldSet, FixedOffset, IanaName, Schedule, ZoneSpec};
 
 #[cfg(feature = "alloc")]
 pub use bind::{BindError, BoundSchedule};

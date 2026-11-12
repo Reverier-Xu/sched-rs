@@ -3,7 +3,11 @@
 //! Fields are advanced from largest to smallest; advancing a field resets
 //! all smaller fields, which are then re-checked. The search is pure
 //! calendar arithmetic — time zones and DST are handled one layer up (see
-//! [`crate::BoundSchedule`]).
+//! `BoundSchedule`).
+//!
+//! The parser guarantees that every field set is non-empty and contains only
+//! values inside its domain. The only runtime validity left to check here is
+//! calendar validity (e.g. February 30th).
 
 use jiff::civil::{Date, DateTime};
 
@@ -74,6 +78,7 @@ impl Cursor {
       self.minute = 0;
       return self.bump_hour();
     }
+    self.second = 0;
     Some(())
   }
 
@@ -83,6 +88,8 @@ impl Cursor {
       self.hour = 0;
       return self.bump_day();
     }
+    self.minute = 0;
+    self.second = 0;
     Some(())
   }
 
@@ -136,8 +143,12 @@ impl Schedule {
   /// [`TriggerError::TimeZoneDeclared`] if the schedule declares one —
   /// civil matching would silently ignore it, so bind the schedule first
   /// with `Schedule::bind`.
+  ///
+  /// Field domains are validated at parse time. A schedule can still return
+  /// `None` because of calendar validity (e.g. February 30th) or because its
+  /// year set has been exhausted.
   pub fn next_after(&self, after: DateTime) -> Result<Option<DateTime>, TriggerError> {
-    if !matches!(self.zone, ZoneSpec::Local) {
+    if !matches!(self.zone, ZoneSpec::Unspecified) {
       return Err(TriggerError::TimeZoneDeclared);
     }
     let Some(start) = Cursor::start_after(after) else {
@@ -148,16 +159,6 @@ impl Schedule {
 
   /// The smallest matching civil date-time at or after `cursor`.
   pub(crate) fn next_civil_from(&self, mut cursor: Cursor) -> Option<Cursor> {
-    // An empty field set can never match.
-    if self.year.is_empty()
-      || self.month.is_empty()
-      || self.day.is_empty()
-      || self.hour.is_empty()
-      || self.minute.is_empty()
-      || self.second.is_empty()
-    {
-      return None;
-    }
     loop {
       if !self.year.contains(cursor.year as u32) {
         let year = self.year.next_ge(cursor.year.max(0) as u32)?;

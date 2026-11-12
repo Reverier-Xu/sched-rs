@@ -3,7 +3,7 @@
 use jiff::tz::{AmbiguousOffset, Offset, TimeZone};
 use jiff::{Timestamp, Zoned};
 
-use crate::schedule::{FixedOffset, IanaName, Schedule, ZoneSpec};
+use crate::schedule::{IanaName, Schedule, ZoneSpec};
 use crate::search::Cursor;
 
 /// A schedule bound to a concrete time zone, ready to compute absolute
@@ -17,16 +17,19 @@ pub struct BoundSchedule {
 impl Schedule {
   /// Binds the schedule's zone declaration to a concrete time zone:
   ///
-  /// - [`ZoneSpec::Local`] → the system time zone
+  /// - [`ZoneSpec::Unspecified`] → the system time zone
   /// - [`ZoneSpec::Fixed`] → a fixed offset
   /// - [`ZoneSpec::Iana`] → an IANA time zone from the database, with DST
   ///   rules
+  ///
+  /// Fixed offsets are validated at parse time, so only an unknown IANA name
+  /// can fail here.
   pub fn bind(&self) -> Result<BoundSchedule, BindError> {
     let tz = match self.zone {
-      ZoneSpec::Local => TimeZone::system(),
+      ZoneSpec::Unspecified => TimeZone::system(),
       ZoneSpec::Fixed(offset) => {
         let offset = Offset::from_seconds(offset.as_seconds())
-          .map_err(|_| BindError::OffsetOutOfRange { offset })?;
+          .expect("fixed offsets are validated at parse time");
         TimeZone::fixed(offset)
       }
       ZoneSpec::Iana(name) => {
@@ -56,20 +59,27 @@ impl BoundSchedule {
   /// Returns `None` if the schedule never matches again (e.g. its year set
   /// is exhausted, or it names a nonexistent date like February 30th).
   ///
-  /// DST transitions: an occurrence inside a gap (spring forward) is
-  /// skipped; an occurrence inside a fold (fall back) fires once, at its
-  /// first occurrence.
+  /// Each civil match fires at most once, at its earliest absolute occurrence.
+  /// If that instant is not strictly after `after`, the match is skipped: a
+  /// fold's second occurrence is never returned, and a civil time inside a
+  /// gap (spring forward) has no occurrence at all.
   pub fn next_after(&self, after: Timestamp) -> Option<Zoned> {
     let mut probe = Cursor::start_after(after.to_zoned(self.tz.clone()).datetime())?;
     loop {
       let candidate = self.schedule.next_civil_from(probe)?;
       let datetime = candidate.to_datetime()?;
       let ambiguous = self.tz.to_ambiguous_zoned(datetime);
-      match ambiguous.offset() {
-        AmbiguousOffset::Unambiguous { .. } => return ambiguous.unambiguous().ok(),
-        AmbiguousOffset::Fold { .. } => return ambiguous.earlier().ok(),
-        AmbiguousOffset::Gap { .. } => probe = candidate.plus_second()?,
+      let earliest = match ambiguous.offset() {
+        AmbiguousOffset::Unambiguous { .. } => ambiguous.unambiguous().ok(),
+        AmbiguousOffset::Fold { .. } => ambiguous.earlier().ok(),
+        AmbiguousOffset::Gap { .. } => None,
+      };
+      if let Some(zoned) = earliest
+        && zoned.timestamp() > after
+      {
+        return Some(zoned);
       }
+      probe = candidate.plus_second()?;
     }
   }
 }
@@ -82,11 +92,5 @@ pub enum BindError {
   UnknownTimeZone {
     /// The offending name.
     name: IanaName,
-  },
-  /// The fixed offset exceeds jiff's range of -25:59:59..=25:59:59.
-  #[error("fixed offset {offset} is outside the supported range -25:59:59..=25:59:59")]
-  OffsetOutOfRange {
-    /// The offending offset.
-    offset: FixedOffset,
   },
 }

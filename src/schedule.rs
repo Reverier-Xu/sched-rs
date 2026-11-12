@@ -6,17 +6,19 @@
 use core::fmt;
 
 /// Maximum length of an IANA time zone name, in bytes.
-pub const MAX_TZ_NAME_LEN: usize = 64;
+pub(crate) const MAX_TZ_NAME_LEN: usize = 64;
 
 /// A set of field values, stored as a bitmap of `WORDS * 64` bits.
 ///
 /// Every schedule field is one of these; only the capacity differs:
 ///
-/// The month, day, hour, minute and second fields use `FieldSet<1>` (64
-/// bits cover every real value, since those domains stop at 59); the year
-/// field uses `FieldSet<157>` (10048 bits cover 0..=9999, every real year).
+/// The month, day, hour, minute and second fields use `FieldSet<1>` (64 bits
+/// cover every value in their domains); the year field uses `FieldSet<157>`
+/// (10048 bits cover 0..=9999, every real year).
 ///
-/// Bit `v` is set when value `v` is part of the set.
+/// Bit `v` is set when value `v` is part of the set. Sets produced by the
+/// parser are always non-empty and contain only values inside the field's
+/// domain.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FieldSet<const WORDS: usize> {
   words: [u64; WORDS],
@@ -24,30 +26,24 @@ pub struct FieldSet<const WORDS: usize> {
 
 impl<const WORDS: usize> FieldSet<WORDS> {
   /// An empty set.
-  pub const EMPTY: Self = Self { words: [0; WORDS] };
+  pub(crate) const EMPTY: Self = Self { words: [0; WORDS] };
 
   /// The largest value storable in the bitmap.
   const MAX: u32 = WORDS as u32 * 64 - 1;
 
-  /// A set containing every value in `min..=max` (clamped to the bitmap).
-  pub fn full(min: u32, max: u32) -> Self {
-    Self::range(min, max)
-  }
-
-  /// A set containing a single value. Values beyond the bitmap are dropped
-  /// (they could never match a real field value).
+  /// A set containing a single value. The parser guarantees the value is
+  /// inside the field's domain.
   pub(crate) fn single(value: u32) -> Self {
     Self::range(value, value)
   }
 
-  /// A set covering `start..=end`, clamped to the bitmap: `{0-200}` still
-  /// covers every real minute, while a range starting above the bitmap's
-  /// capacity comes back empty. Inverted ranges are empty too.
+  /// A set covering `start..=end`. The parser guarantees `start <= end` and
+  /// that both endpoints are inside the field's domain.
   pub(crate) fn range(start: u32, end: u32) -> Self {
+    debug_assert!(start <= end);
+    debug_assert!(end <= Self::MAX);
     let mut set = Self::EMPTY;
-    if start <= Self::MAX {
-      set.insert_range(start, end.min(Self::MAX));
-    }
+    set.insert_range(start, end);
     set
   }
 
@@ -117,7 +113,7 @@ impl<const WORDS: usize> FieldSet<WORDS> {
   }
 
   /// The smallest value in the set greater than or equal to `value`.
-  pub fn next_ge(&self, value: u32) -> Option<u32> {
+  pub(crate) fn next_ge(&self, value: u32) -> Option<u32> {
     if value > Self::MAX {
       return None;
     }
@@ -133,12 +129,12 @@ impl<const WORDS: usize> FieldSet<WORDS> {
   }
 
   /// The smallest value in the set strictly greater than `value`.
-  pub fn next_gt(&self, value: u32) -> Option<u32> {
+  pub(crate) fn next_gt(&self, value: u32) -> Option<u32> {
     self.next_ge(value.checked_add(1)?)
   }
 
   /// Iterates over the values in ascending order.
-  pub fn iter(&self) -> FieldSetIter<'_, WORDS> {
+  pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
     FieldSetIter {
       words: &self.words,
       word: 0,
@@ -148,7 +144,7 @@ impl<const WORDS: usize> FieldSet<WORDS> {
 
   /// Iterates over maximal runs of consecutive values, e.g. `{8,12-14}`
   /// yields `(8, 8)` and `(12, 14)`.
-  pub fn runs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+  fn runs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
     let mut iter = self.iter().peekable();
     core::iter::from_fn(move || {
       let start = iter.next()?;
@@ -183,7 +179,7 @@ impl<const WORDS: usize> fmt::Debug for FieldSet<WORDS> {
 }
 
 /// Iterator over the values of a [`FieldSet`], in ascending order.
-pub struct FieldSetIter<'a, const WORDS: usize> {
+struct FieldSetIter<'a, const WORDS: usize> {
   words: &'a [u64; WORDS],
   word: usize,
   bits: u64,
@@ -249,6 +245,9 @@ impl fmt::Display for IanaName {
 }
 
 /// A fixed UTC offset, e.g. `+08:00`.
+///
+/// Offsets are validated when parsed: hours are at most 25 and minutes at
+/// most 59, matching jiff's `-25:59:59..=25:59:59` range.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FixedOffset {
   seconds: i32,
@@ -259,7 +258,9 @@ impl FixedOffset {
   pub const UTC: Self = Self { seconds: 0 };
 
   /// Creates an offset from a total number of seconds.
-  pub const fn from_seconds(seconds: i32) -> Self {
+  ///
+  /// The parser validates the range before calling this.
+  pub(crate) const fn from_seconds(seconds: i32) -> Self {
     Self { seconds }
   }
 
@@ -290,8 +291,9 @@ impl fmt::Display for FixedOffset {
 /// The time zone declaration of a schedule.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ZoneSpec {
-  /// No declaration: the device's local time zone is used.
-  Local,
+  /// No declaration: [`Schedule::next_after`] matches civil time, and
+  /// `Schedule::bind` resolves to the system time zone.
+  Unspecified,
   /// A fixed UTC offset, e.g. `+08:00`, `-05:00` or `Z`.
   Fixed(FixedOffset),
   /// An IANA time zone name, e.g. `[Asia/Shanghai]`. DST rules apply.
@@ -301,22 +303,54 @@ pub enum ZoneSpec {
 /// A parsed schedule expression.
 ///
 /// Example: `2026-{*}-{*}T{8,12-14}:00:00[Asia/Shanghai]`.
+///
+/// Field domains and ranges are validated at parse time. Calendar validity
+/// (e.g. February 30th, or February 29th in a non-leap year) is checked when
+/// computing trigger times.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Schedule {
-  /// Year, e.g. `2026` or `{2024-2030}`. Values above 9999 never match a
-  /// real year.
-  pub year: FieldSet<157>,
-  /// Month, 1..=12. Values outside the domain parse fine but never match.
-  pub month: FieldSet<1>,
-  /// Day of month, 1..=31. Days that don't exist in a given month
-  /// (e.g. February 30th) are silently skipped when computing triggers.
-  pub day: FieldSet<1>,
-  /// Hour, 0..=23.
-  pub hour: FieldSet<1>,
-  /// Minute, 0..=59.
-  pub minute: FieldSet<1>,
-  /// Second, 0..=59.
-  pub second: FieldSet<1>,
-  /// Time zone declaration.
-  pub zone: ZoneSpec,
+  pub(crate) year: FieldSet<157>,
+  pub(crate) month: FieldSet<1>,
+  pub(crate) day: FieldSet<1>,
+  pub(crate) hour: FieldSet<1>,
+  pub(crate) minute: FieldSet<1>,
+  pub(crate) second: FieldSet<1>,
+  pub(crate) zone: ZoneSpec,
+}
+
+impl Schedule {
+  /// The year set, e.g. `{2024-2030}` or `{*}`.
+  pub fn year(&self) -> &FieldSet<157> {
+    &self.year
+  }
+
+  /// The month set.
+  pub fn month(&self) -> &FieldSet<1> {
+    &self.month
+  }
+
+  /// The day-of-month set.
+  pub fn day(&self) -> &FieldSet<1> {
+    &self.day
+  }
+
+  /// The hour set.
+  pub fn hour(&self) -> &FieldSet<1> {
+    &self.hour
+  }
+
+  /// The minute set.
+  pub fn minute(&self) -> &FieldSet<1> {
+    &self.minute
+  }
+
+  /// The second set.
+  pub fn second(&self) -> &FieldSet<1> {
+    &self.second
+  }
+
+  /// The time zone declaration.
+  pub fn zone(&self) -> ZoneSpec {
+    self.zone
+  }
 }

@@ -16,26 +16,26 @@
 //! the grammar is strict. Every list position requires an item: `{}`,
 //! `{,}` and `{9,,}` are syntax errors.
 //!
-//! Validity is not checked at parse time: values that can never match a
-//! real date-time (a month of `13`, February 30th, an inverted range like
-//! `{14-8}`, an offset of `+99:00`) parse fine but simply never trigger.
-//! The only parse errors are malformed syntax and year lists exceeding
-//! [`MAX_YEAR_RANGES`].
+//! Validation is strict. Field values must be inside their calendrical
+//! domain, ranges must be non-inverted, and fixed offsets must fit jiff's
+//! `-25:59..=+25:59` range; anything else is a parse error. Calendar
+//! validity (February 30th, February 29th in a non-leap year) is checked
+//! when computing trigger times, so such expressions parse but never match.
 
 use winnow::ascii::{digit1, multispace0};
 use winnow::combinator::{
-  alt, cut_err, delimited, fail, opt, peek, preceded, repeat, separated_foldl1, terminated,
+  alt, cut_err, delimited, fail, opt, peek, preceded, separated_foldl1, terminated,
 };
 use winnow::dispatch;
 use winnow::error::{ContextError, ErrMode};
-use winnow::token::{any, one_of, take_till, take_while};
+use winnow::token::{any, one_of, take_while};
 use winnow::{ModalResult, Parser};
 
 use crate::error::ParseError;
 use crate::schedule::{FieldSet, FixedOffset, IanaName, MAX_TZ_NAME_LEN, Schedule, ZoneSpec};
 
-/// A schedule field. Only used to look up each field's calendrical domain
-/// for `{*}` expansion.
+/// A schedule field. Used to look up each field's calendrical domain for
+/// `{*}` expansion and for range validation.
 #[derive(Clone, Copy)]
 enum Field {
   Year,
@@ -47,11 +47,8 @@ enum Field {
 }
 
 impl Field {
-  /// The field's full calendrical domain, i.e. the values `{*}` expands to.
-  ///
-  /// This is not a validity check: values outside the domain parse fine but
-  /// simply never match when computing trigger times (validity is jiff's
-  /// job, enforced when civil date-times are constructed).
+  /// The field's full calendrical domain, i.e. the values `{*}` expands to
+  /// and the only values an explicit item may contain.
   fn domain(self) -> (u32, u32) {
     match self {
       Self::Year => (1, 9999),
@@ -61,6 +58,10 @@ impl Field {
       Self::Minute | Self::Second => (0, 59),
     }
   }
+}
+
+fn in_domain(value: u32, domain: (u32, u32)) -> bool {
+  (domain.0..=domain.1).contains(&value)
 }
 
 /// Parses a complete schedule expression.
@@ -76,8 +77,9 @@ pub fn parse(input: &str) -> Result<Schedule, ParseError> {
 // Tokens
 // ---------------------------------------------------------------------------
 
-/// A run of ASCII digits as a `u32`, saturating on overflow. A saturated
-/// value exceeds every storage domain and simply never matches.
+/// A run of ASCII digits as a `u32`, saturating on overflow. Field and offset
+/// parsers reject values outside their domain, so saturation never silently
+/// changes a valid schedule.
 fn number(input: &mut &str) -> ModalResult<u32> {
   digit1
     .map(|digits: &str| {
@@ -96,47 +98,71 @@ where
   delimited(multispace0, parser, multispace0)
 }
 
+/// A single number that must be inside `domain`. On failure the input is
+/// rewound to the number's start so the reported offset points at the value.
+fn checked_number<'a>(domain: (u32, u32)) -> impl Parser<&'a str, u32, ErrMode<ContextError>> {
+  move |input: &mut &'a str| {
+    let start = *input;
+    let value = number.parse_next(input)?;
+    if !in_domain(value, domain) {
+      *input = start;
+      return Err(ErrMode::Cut(ContextError::new()));
+    }
+    Ok(value)
+  }
+}
+
+/// `digits (ws "-" ws digits)?` — a single value or an inclusive range, both
+/// inside `domain`. On failure the input is rewound to the offending item so
+/// the reported offset points at the value.
+fn item<'a>(domain: (u32, u32)) -> impl Parser<&'a str, (u32, u32), ErrMode<ContextError>> {
+  move |input: &mut &'a str| {
+    let start_pos = *input;
+    let start = number.parse_next(input)?;
+    if !in_domain(start, domain) {
+      *input = start_pos;
+      return Err(ErrMode::Cut(ContextError::new()));
+    }
+    let end = if opt(ws('-')).parse_next(input)?.is_some() {
+      let end_pos = *input;
+      let end = number.parse_next(input)?;
+      if !in_domain(end, domain) || start > end {
+        *input = if start > end { start_pos } else { end_pos };
+        return Err(ErrMode::Cut(ContextError::new()));
+      }
+      end
+    } else {
+      start
+    };
+    Ok((start, end))
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Brace expressions
 // ---------------------------------------------------------------------------
-
-/// `digits (ws "-" ws digits)?` — a single value or an inclusive range.
-fn item(input: &mut &str) -> ModalResult<(u32, u32)> {
-  let start = number.parse_next(input)?;
-  let end = opt(preceded(ws('-'), number))
-    .parse_next(input)?
-    .unwrap_or(start);
-  Ok((start, end))
-}
-
-/// The result of a brace expression: the wildcard or a list of items.
-enum Brace<T> {
-  Any,
-  Items(T),
-}
 
 /// The body of a brace expression: `"*" | items ","?`.
 ///
 /// Whitespace is allowed around every token, and a single trailing comma is
 /// permitted (`{9,}`). Every list position requires an item, so `{}`,
 /// `{,}` and `{9,,}` fail here.
-fn brace_body<'a, T, I, M>(
-  item: I, mut merge: M,
-) -> impl Parser<&'a str, Brace<T>, ErrMode<ContextError>>
-where
-  I: Parser<&'a str, T, ErrMode<ContextError>>,
-  M: FnMut(T, T) -> T,
-{
+fn brace<'a, const WORDS: usize>(
+  domain: (u32, u32),
+) -> impl Parser<&'a str, FieldSet<WORDS>, ErrMode<ContextError>> {
   preceded(
     '{',
     cut_err(terminated(
       alt((
-        ws('*').map(|_| Brace::Any),
+        ws('*').map(move |_| FieldSet::<WORDS>::range(domain.0, domain.1)),
         terminated(
-          separated_foldl1(ws(item), ws(','), move |acc, _, item| merge(acc, item)),
+          separated_foldl1(
+            ws(item(domain)).map(|(start, end)| FieldSet::<WORDS>::range(start, end)),
+            ws(','),
+            |acc, _, item| acc.union(item),
+          ),
           ws(opt(',')),
-        )
-        .map(Brace::Items),
+        ),
       )),
       '}',
     )),
@@ -147,22 +173,16 @@ where
 // Fields
 // ---------------------------------------------------------------------------
 
-/// A field: digits or a brace expression. `domain` is the field's
-/// calendrical domain, used for `{*}` expansion.
-fn field<const WORDS: usize>(
-  domain: (u32, u32),
-) -> impl FnMut(&mut &str) -> ModalResult<FieldSet<WORDS>> {
+/// A field: digits or a brace expression. `field` supplies the calendrical
+/// domain used for `{*}` expansion and range validation.
+fn field<'a, const WORDS: usize>(
+  field: Field,
+) -> impl FnMut(&mut &'a str) -> ModalResult<FieldSet<WORDS>> {
+  let domain = field.domain();
   move |input| {
     dispatch! {peek(any);
-      '{' => brace_body(
-        item.map(|(start, end)| FieldSet::<WORDS>::range(start, end)),
-        |acc, item| acc.union(item),
-      )
-      .map(move |brace| match brace {
-        Brace::Any => FieldSet::full(domain.0, domain.1),
-        Brace::Items(set) => set,
-      }),
-      _ => number.map(FieldSet::<WORDS>::single),
+      '{' => brace::<WORDS>(domain),
+      _ => checked_number(domain).map(FieldSet::<WORDS>::single),
     }
     .parse_next(input)
   }
@@ -177,9 +197,25 @@ fn is_zone_char(c: char) -> bool {
 }
 
 /// `("+"|"-") digits ":" digits` — a fixed UTC offset, e.g. `+08:00`.
+///
+/// Hours are limited to `0..=25` and minutes to `0..=59`, matching jiff's
+/// `-25:59:59..=25:59:59` range. Larger components are parse errors, not
+/// silently normalized (`+00:99` is not `+01:39`).
 fn fixed_offset(input: &mut &str) -> ModalResult<ZoneSpec> {
   let negative = one_of(['+', '-']).parse_next(input)? == '-';
-  let (hours, _, minutes) = cut_err((number, ':', number)).parse_next(input)?;
+  let hours_pos = *input;
+  let hours = cut_err(number).parse_next(input)?;
+  if hours > 25 {
+    *input = hours_pos;
+    return Err(ErrMode::Cut(ContextError::new()));
+  }
+  let _ = cut_err(':').parse_next(input)?;
+  let minutes_pos = *input;
+  let minutes = cut_err(number).parse_next(input)?;
+  if minutes > 59 {
+    *input = minutes_pos;
+    return Err(ErrMode::Cut(ContextError::new()));
+  }
   let total = (hours * 3600 + minutes * 60) as i32;
   Ok(ZoneSpec::Fixed(FixedOffset::from_seconds(if negative {
     -total
@@ -215,91 +251,24 @@ fn zone_decl(input: &mut &str) -> ModalResult<ZoneSpec> {
 }
 
 // ---------------------------------------------------------------------------
-// Structural segmentation
-// ---------------------------------------------------------------------------
-
-/// Consumes a field segment: everything up to the next `stop` character
-/// outside braces (the delimiter itself is left unconsumed). `{...}` spans
-/// count as opaque content. Empty segments are rejected.
-fn segment<'a>(
-  stop: impl Fn(char) -> bool,
-) -> impl Parser<&'a str, &'a str, ErrMode<ContextError>> {
-  repeat(
-    0..,
-    alt((
-      ('{', take_till(0.., '}'), '}').void(),
-      take_while(1.., move |c: char| !stop(c) && c != '{' && c != '}').void(),
-    )),
-  )
-  .fold(|| (), |(), _| ())
-  .take()
-  .verify(|s: &str| !s.is_empty())
-}
-
-/// Parses a segment's content to completion. On failure, the outer input
-/// is rewound to the failure point so the top-level [`parse`] reports the
-/// absolute offset.
-fn subparse<'a, T>(
-  mut parser: impl FnMut(&mut &'a str) -> ModalResult<T>, seg: &'a str, origin: &'a str,
-  input: &mut &'a str,
-) -> ModalResult<T> {
-  match parser.parse(seg) {
-    Ok(value) => Ok(value),
-    Err(err) => {
-      let at = (seg.as_ptr() as usize - origin.as_ptr() as usize) + err.offset();
-      *input = &origin[at..];
-      Err(ErrMode::Cut(ContextError::new()))
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Top level
 // ---------------------------------------------------------------------------
 
-/// Parses the next field segment: locate its extent, then parse the
-/// content to completion (see [`segment`] and [`subparse`]).
-fn next_segment<'a, T>(
-  parser: impl FnMut(&mut &'a str) -> ModalResult<T>, stop: impl Fn(char) -> bool, origin: &'a str,
-  input: &mut &'a str,
-) -> ModalResult<T> {
-  subparse(parser, segment(stop).parse_next(input)?, origin, input)
-}
-
 fn schedule(input: &mut &str) -> ModalResult<Schedule> {
-  let origin = *input;
-  let year = next_segment(field(Field::Year.domain()), |c| c == '-', origin, input)?;
+  let year: FieldSet<157> = field(Field::Year).parse_next(input)?;
   let _ = cut_err('-').parse_next(input)?;
-  let month = next_segment(field(Field::Month.domain()), |c| c == '-', origin, input)?;
+  let month: FieldSet<1> = field(Field::Month).parse_next(input)?;
   let _ = cut_err('-').parse_next(input)?;
-  let day = next_segment(
-    field(Field::Day.domain()),
-    |c| c == 'T' || c == 't',
-    origin,
-    input,
-  )?;
+  let day: FieldSet<1> = field(Field::Day).parse_next(input)?;
   let _ = cut_err(one_of(['T', 't'])).parse_next(input)?;
-  let hour = next_segment(field(Field::Hour.domain()), |c| c == ':', origin, input)?;
+  let hour: FieldSet<1> = field(Field::Hour).parse_next(input)?;
   let _ = cut_err(':').parse_next(input)?;
-  let minute = next_segment(field(Field::Minute.domain()), |c| c == ':', origin, input)?;
+  let minute: FieldSet<1> = field(Field::Minute).parse_next(input)?;
   let _ = cut_err(':').parse_next(input)?;
-  // The second field ends where the time zone declaration starts.
-  let second = next_segment(
-    field(Field::Second.domain()),
-    |c| matches!(c, 'Z' | 'z' | '+' | '-' | '['),
-    origin,
-    input,
-  )?;
-  let rest = *input;
-  let zone = if rest.is_empty() {
-    ZoneSpec::Local
-  } else {
-    let parsed = subparse(zone_decl, rest, origin, input)?;
-    // The zone parser consumed all of `rest` (subparse requires complete
-    // consumption); move the outer cursor past it.
-    *input = &rest[rest.len()..];
-    parsed
-  };
+  let second: FieldSet<1> = field(Field::Second).parse_next(input)?;
+  let zone = opt(zone_decl)
+    .parse_next(input)?
+    .unwrap_or(ZoneSpec::Unspecified);
   Ok(Schedule {
     year,
     month,
