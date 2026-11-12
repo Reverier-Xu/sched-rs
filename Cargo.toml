@@ -1,0 +1,51 @@
+[workspace]
+members = ["crates/schedd"]
+
+[package]
+authors      = ["Reverier-Xu <reverier.xu@woooo.tech>"]
+edition      = "2024"
+license      = "MIT or Apache-2.0"
+name         = "sched"
+readme       = "README.md"
+repository   = "https://github.com/Reverier-Xu/sched-rs"
+rust-version = "1.99"
+version      = "0.1.0"
+
+
+[features]
+default       = ["std", "tzdb-platform"]
+# Enable allocation support (for no_std + alloc environments)
+alloc         = ["jiff/alloc", "winnow/alloc"]
+std           = [
+    "alloc",
+    "jiff/std",
+    "jiff/tz-system",
+    "jiff/tzdb-zoneinfo",
+    "jiff/tzdb-concatenated",
+    "thiserror/std",
+    "winnow/std",
+]
+# Always use the bundled tzdb on all platforms (maps to jiff's tzdb-bundle-always)
+bundle-tzdb   = ["alloc", "jiff/tzdb-bundle-always"]
+# Use the bundled tzdb only on platforms without a system time zone database,
+# e.g. Windows (maps to jiff's tzdb-bundle-platform)
+tzdb-platform = ["alloc", "jiff/tzdb-bundle-platform"]
+
+[dependencies]
+jiff      = { version = "0.2", default-features = false, features = [
+    "tz-fat",
+    "perf-inline",
+] }
+thiserror = { version = "2.0", default-features = false }
+tracing   = { version = "0.1", default-features = false }
+winnow    = { version = "1.0", default-features = false, features = [
+    "ascii",
+] }
+
+[dev-dependencies]
+criterion          = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bench]]
+name    = "parser"
+harness = false

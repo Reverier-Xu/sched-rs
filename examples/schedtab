@@ -1,0 +1,14 @@
+# schedtab — schedd demo table.
+#
+# One entry per line: `<schedule expression> <command>`. `#` starts a
+# comment. The command runs via `bash -c`. All entries below fire within
+# seconds so the demo is watchable end to end.
+
+# Every second.
+{*}-{*}-{*}T{*}:{*}:{*}Z        echo "sched: heartbeat"
+
+# Twice a minute.
+{*}-{*}-{*}T{*}:{*}:{0,30}Z     echo "sched: half-minute mark (host: $(hostname))"
+
+# Quarter marks, and a failing command to exercise the WARN log path.
+{*}-{*}-{*}T{*}:{*}:{15,45}Z    echo "sched: quarter mark"; echo "sched: simulated failure" >&2; exit 3
