@@ -34,12 +34,14 @@ cli = [
   "std",
   "tzdb-platform",
   "dep:async-process",
+  "dep:ctrlc",
   "dep:smol",
   "dep:tracing-subscriber",
 ]
 
 [dependencies]
 async-process = { version = "2", optional = true }
+ctrlc = { version = "3", features = ["termination"], optional = true }
 jiff = { version = "0.2", default-features = false, features = [
   "tz-fat",
   "perf-inline",

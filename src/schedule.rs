@@ -8,6 +8,39 @@ use core::fmt;
 /// Maximum length of an IANA time zone name, in bytes.
 pub(crate) const MAX_TZ_NAME_LEN: usize = 64;
 
+/// A schedule field. Used by the parser for value validation and by
+/// `Display` to decide when a set covers the whole domain and renders as
+/// `{*}`.
+#[derive(Clone, Copy)]
+pub(crate) enum Field {
+  Year,
+  Month,
+  Day,
+  Hour,
+  Minute,
+  Second,
+}
+
+impl Field {
+  /// The field's full domain, i.e. the values `{*}` expands to and the only
+  /// values an explicit item may contain.
+  pub(crate) fn domain(self) -> (u32, u32) {
+    match self {
+      Self::Year => (1, 9999),
+      Self::Month => (1, 12),
+      Self::Day => (1, 31),
+      Self::Hour => (0, 23),
+      Self::Minute | Self::Second => (0, 59),
+    }
+  }
+
+  /// The number of values in the domain.
+  fn len(self) -> u32 {
+    let (start, end) = self.domain();
+    end - start + 1
+  }
+}
+
 /// A set of field values, stored as a bitmap of `WORDS * 64` bits.
 ///
 /// Every schedule field is one of these; only the capacity differs:
@@ -307,7 +340,11 @@ pub enum ZoneSpec {
 /// Field domains and ranges are validated at parse time. Calendar validity
 /// (e.g. February 30th, or February 29th in a non-leap year) is checked when
 /// computing trigger times.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///
+/// A schedule is a fixed-size value of roughly 1.3 KiB, so it is [`Clone`]
+/// but deliberately not `Copy`: share it behind an `Arc` when several tasks
+/// need the same schedule instead of copying it implicitly.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Schedule {
   pub(crate) year: FieldSet<157>,
   pub(crate) month: FieldSet<1>,
@@ -352,5 +389,67 @@ impl Schedule {
   /// The time zone declaration.
   pub fn zone(&self) -> ZoneSpec {
     self.zone
+  }
+}
+
+/// Writes one field as a valid schedule expression: a bare value, `{*}` for a
+/// full domain, or a brace list of values and inclusive ranges. Values are
+/// zero-padded to `width` so the output is canonical.
+fn write_field<const WORDS: usize>(
+  f: &mut fmt::Formatter<'_>, set: &FieldSet<WORDS>, field: Field, width: usize,
+) -> fmt::Result {
+  let domain_len = field.len();
+  if set.len() == 1 {
+    return write!(
+      f,
+      "{:0width$}",
+      set.min().expect("parsed field sets are non-empty"),
+      width = width
+    );
+  }
+  // The parser guarantees every value is inside the domain, so a set of the
+  // domain's size must cover it exactly.
+  if set.len() == domain_len {
+    return f.write_str("{*}");
+  }
+  f.write_str("{")?;
+  for (i, (start, end)) in set.runs().enumerate() {
+    if i > 0 {
+      f.write_str(",")?;
+    }
+    if start == end {
+      write!(f, "{start:0width$}", width = width)?;
+    } else {
+      write!(
+        f,
+        "{start:0width$}-{end:0width$}",
+        width = width,
+        start = start,
+        end = end
+      )?;
+    }
+  }
+  f.write_str("}")
+}
+
+/// Renders the schedule as an expression that parses back to the same value.
+impl fmt::Display for Schedule {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write_field(f, &self.year, Field::Year, 4)?;
+    f.write_str("-")?;
+    write_field(f, &self.month, Field::Month, 2)?;
+    f.write_str("-")?;
+    write_field(f, &self.day, Field::Day, 2)?;
+    f.write_str("T")?;
+    write_field(f, &self.hour, Field::Hour, 2)?;
+    f.write_str(":")?;
+    write_field(f, &self.minute, Field::Minute, 2)?;
+    f.write_str(":")?;
+    write_field(f, &self.second, Field::Second, 2)?;
+    match self.zone {
+      ZoneSpec::Unspecified => Ok(()),
+      ZoneSpec::Fixed(offset) => write!(f, "{offset}"),
+      ZoneSpec::Iana(name) => write!(f, "[{name}]"),
+    }
   }
 }

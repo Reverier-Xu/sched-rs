@@ -4,27 +4,49 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  lint:
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features --locked
-      - run: cargo doc --workspace --no-deps --all-features
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo doc --workspace --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      - run: cargo package --allow-dirty --no-verify
+      - run: cargo package --locked
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-26, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features --locked
 
   features:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --no-default-features --locked

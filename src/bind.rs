@@ -25,21 +25,32 @@ impl Schedule {
   /// Fixed offsets are validated at parse time, so only an unknown IANA name
   /// can fail here.
   pub fn bind(&self) -> Result<BoundSchedule, BindError> {
-    let tz = match self.zone {
-      ZoneSpec::Unspecified => TimeZone::system(),
+    let tz = self.resolve_zone()?;
+    Ok(BoundSchedule {
+      schedule: self.clone(),
+      tz,
+    })
+  }
+
+  /// Like [`Schedule::bind`], but consumes the schedule instead of cloning
+  /// it. Used when the caller hands ownership to the trigger.
+  pub(crate) fn bind_owned(self) -> Result<BoundSchedule, BindError> {
+    let tz = self.resolve_zone()?;
+    Ok(BoundSchedule { schedule: self, tz })
+  }
+
+  fn resolve_zone(&self) -> Result<TimeZone, BindError> {
+    match self.zone {
+      ZoneSpec::Unspecified => Ok(TimeZone::system()),
       ZoneSpec::Fixed(offset) => {
         let offset = Offset::from_seconds(offset.as_seconds())
           .expect("fixed offsets are validated at parse time");
-        TimeZone::fixed(offset)
+        Ok(TimeZone::fixed(offset))
       }
       ZoneSpec::Iana(name) => {
-        TimeZone::get(name.as_str()).map_err(|_| BindError::UnknownTimeZone { name })?
+        TimeZone::get(name.as_str()).map_err(|_| BindError::UnknownTimeZone { name })
       }
-    };
-    Ok(BoundSchedule {
-      schedule: *self,
-      tz,
-    })
+    }
   }
 }
 

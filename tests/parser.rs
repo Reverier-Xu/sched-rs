@@ -298,3 +298,38 @@ fn from_str_roundtrip() {
     other => panic!("expected IANA zone, got {other:?}"),
   }
 }
+
+#[test]
+fn display_is_canonical() {
+  let schedule: Schedule = "2026-3-8T3:4:5".parse().unwrap();
+  assert_eq!(schedule.to_string(), "2026-03-08T03:04:05");
+
+  let schedule: Schedule = "{2024-2026,2030}-{1,3}-01T00:00:00Z".parse().unwrap();
+  assert_eq!(
+    schedule.to_string(),
+    "{2024-2026,2030}-{01,03}-01T00:00:00+00:00"
+  );
+}
+
+#[test]
+fn display_roundtrips() {
+  for input in [
+    "2026-03-08T12:30:45+08:00",
+    "2026-{*}-{*}T{8,12-14}:00:00",
+    "{*}-{*}-{*}T08:00:00[America/Sao_Paulo]",
+    "{2024-2026,2030,2040-2042}-01-01T00:00:00Z",
+    "2026-1-2T3:4:5",
+    "{*}-{*}-{*}T{*}:{*}:{*}",
+    "2026-01-01T00:00:00-05:30",
+  ] {
+    let schedule = parse(input).unwrap();
+    let rendered = schedule.to_string();
+    let reparsed: Schedule = rendered
+      .parse()
+      .unwrap_or_else(|error| panic!("{input:?} rendered as {rendered:?}: {error}"));
+    assert_eq!(
+      reparsed, schedule,
+      "input {input:?} rendered as {rendered:?}"
+    );
+  }
+}

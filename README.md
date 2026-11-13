@@ -76,14 +76,14 @@ late. `fire_due` only fires the tick the scheduler actually waited for; a
 tick that is already stale by dispatch time is skipped, never replayed. Each
 run receives the nominal trigger time; the task can call `Timestamp::now()`
 for its actual execution time. A tick whose previous run is still in flight
-is skipped.
+is skipped. Each task's first occurrence is computed when it is registered.
 
 ## Features
 
 | Feature | Meaning |
 | --- | --- |
-| `std` (default) | Standard library support. |
-| `alloc` | Time zone binding and `Trigger` in `no_std + alloc` environments. |
+| `std` (default) | Standard library support, including the clock-based `Trigger::register`. |
+| `alloc` | Time zone binding and `Trigger` in `no_std + alloc` environments; use `Trigger::register_at` to supply the clock. |
 | `bundle-tzdb` | Always use the bundled time zone database. |
 | `tzdb-platform` (default) | Use the bundled database only where the platform has none. |
 | `cli` | Build the `sched` daemon binary. Not enabled by default; implies `std` and `tzdb-platform`. |
@@ -100,7 +100,8 @@ The civil-only API (`Schedule::next_after`) works with no features at all.
 ## `sched` daemon
 
 The non-default `cli` feature builds the `sched` binary, a small daemon that
-reads a crontab-style file and runs commands through `bash -c`:
+reads a crontab-style file and runs commands through the platform shell
+(`bash -c` on Unix, `cmd /C` on Windows):
 
 ```text
 {*}-{*}-{*}T08:00:00[Asia/Shanghai]   echo "good morning"
@@ -115,6 +116,11 @@ install it with `cargo install sched --features cli`.
 Each command receives `SCHED_SCHEDULED_AT` (the nominal trigger time) in its
 environment. The command can get its actual execution time itself, e.g. with
 `date`.
+
+On Unix, the schedtab must not be writable by group or others; a daemon
+running as root would otherwise execute commands injected by an unprivileged
+user. SIGINT, SIGTERM and SIGHUP stop the scheduler and wait for in-flight
+commands to finish before exiting (Ctrl-C or console close on Windows).
 
 ## Development
 
