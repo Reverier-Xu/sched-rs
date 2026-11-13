@@ -1,6 +1,7 @@
 //! A runtime-agnostic task trigger.
 
 use alloc::boxed::Box;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -28,7 +29,7 @@ type BoxTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TaskId {
   index: usize,
-  generation: u32,
+  generation: u64,
 }
 
 impl TaskId {
@@ -39,7 +40,7 @@ impl TaskId {
 
   /// The slot generation this id was issued for. Not part of the stable API
   /// surface beyond equality comparisons; exposed for diagnostics.
-  pub fn generation(self) -> u32 {
+  pub fn generation(self) -> u64 {
     self.generation
   }
 }
@@ -50,6 +51,36 @@ struct Task {
   callback: Box<dyn FnMut(Timestamp) -> BoxTaskFuture + Send + 'static>,
   running: Arc<AtomicBool>,
   next: Option<Timestamp>,
+}
+
+/// Clears a task's in-flight flag if the callback panics before the
+/// [`TaskRun`] that owns the flag is created.
+struct RunningGuard {
+  running: Arc<AtomicBool>,
+  armed: bool,
+}
+
+impl RunningGuard {
+  fn new(running: Arc<AtomicBool>) -> Self {
+    Self {
+      running,
+      armed: true,
+    }
+  }
+
+  /// Transfers the flag to the returned [`TaskRun`] without clearing it.
+  fn disarm(mut self) -> Arc<AtomicBool> {
+    self.armed = false;
+    Arc::clone(&self.running)
+  }
+}
+
+impl Drop for RunningGuard {
+  fn drop(&mut self) {
+    if self.armed {
+      self.running.store(false, Ordering::Release);
+    }
+  }
 }
 
 /// A pending task run produced by [`Trigger::fire_due`].
@@ -127,6 +158,11 @@ impl fmt::Debug for TaskRun {
 /// Overlap policy: if a task's previous run is still in flight when its next
 /// tick fires, the tick is skipped (and logged at `WARN`).
 ///
+/// Each task's first occurrence is computed when it is registered, relative
+/// to the clock (or to the explicit `now` passed to [`Trigger::register_at`]).
+/// A task whose schedule is already exhausted stores no next occurrence, so
+/// `None` from [`Trigger::next`] only means no task will fire again.
+///
 /// Missed-tick policy: a tick that is already stale when the scheduler
 /// dispatches is skipped, not replayed. [`Trigger::next`] may return an
 /// instant that is already in the past when the caller is late;
@@ -142,7 +178,7 @@ pub struct Trigger {
 
 #[derive(Default)]
 struct Slot {
-  generation: u32,
+  generation: u64,
   task: Option<Task>,
 }
 
@@ -166,16 +202,41 @@ impl Trigger {
   ///
   /// The callback is invoked when a tick fires; the future it returns
   /// performs the actual work once spawned onto the host runtime.
+  ///
+  /// The task's first occurrence is computed at registration time, relative
+  /// to the current clock. Use [`Trigger::register_at`] for deterministic
+  /// scheduling, e.g. in tests. In `no_std + alloc` environments there is no
+  /// clock, so use [`Trigger::register_at`] instead.
+  #[cfg(feature = "std")]
   pub fn register<F, Fut>(&mut self, schedule: &str, callback: F) -> Result<TaskId, RegisterError>
   where
     F: FnMut(Timestamp) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
   {
+    self.register_at(Timestamp::now(), schedule, callback)
+  }
+
+  /// Parses and registers a schedule expression, computing its first
+  /// occurrence relative to `now`.
+  pub fn register_at<F, Fut>(
+    &mut self, now: Timestamp, schedule: &str, callback: F,
+  ) -> Result<TaskId, RegisterError>
+  where
+    F: FnMut(Timestamp) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+  {
     let parsed: Schedule = schedule.parse()?;
-    self.register_schedule_with_expr(parsed, schedule, callback)
+    self.register_schedule_with_expr_at(now, parsed, schedule, callback)
   }
 
   /// Registers an already-parsed [`Schedule`].
+  ///
+  /// The task's first occurrence is computed at registration time, relative
+  /// to the current clock. Use [`Trigger::register_schedule_at`] for
+  /// deterministic scheduling, e.g. in tests. In `no_std + alloc`
+  /// environments there is no clock, so use
+  /// [`Trigger::register_schedule_at`] instead.
+  #[cfg(feature = "std")]
   pub fn register_schedule<F, Fut>(
     &mut self, schedule: Schedule, callback: F,
   ) -> Result<TaskId, RegisterError>
@@ -183,23 +244,37 @@ impl Trigger {
     F: FnMut(Timestamp) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
   {
-    self.register_schedule_with_expr(schedule, "<unnamed>", callback)
+    self.register_schedule_at(Timestamp::now(), schedule, callback)
   }
 
-  fn register_schedule_with_expr<F, Fut>(
-    &mut self, schedule: Schedule, expr: &str, mut callback: F,
+  /// Registers an already-parsed [`Schedule`], computing its first occurrence
+  /// relative to `now`.
+  pub fn register_schedule_at<F, Fut>(
+    &mut self, now: Timestamp, schedule: Schedule, callback: F,
   ) -> Result<TaskId, RegisterError>
   where
     F: FnMut(Timestamp) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
   {
-    let bound = schedule.bind()?;
+    let expr = schedule.to_string();
+    self.register_schedule_with_expr_at(now, schedule, &expr, callback)
+  }
+
+  fn register_schedule_with_expr_at<F, Fut>(
+    &mut self, now: Timestamp, schedule: Schedule, expr: &str, mut callback: F,
+  ) -> Result<TaskId, RegisterError>
+  where
+    F: FnMut(Timestamp) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+  {
+    let bound = schedule.bind_owned()?;
+    let next = bound.next_after(now).map(|zoned| zoned.timestamp());
     let task = Task {
       schedule: bound,
       expr: expr.into(),
       callback: Box::new(move |scheduled_at| Box::pin(callback(scheduled_at)) as BoxTaskFuture),
       running: Arc::new(AtomicBool::new(false)),
-      next: None,
+      next,
     };
     let id = match self.tasks.iter().position(|slot| slot.task.is_none()) {
       Some(index) => {
@@ -229,6 +304,7 @@ impl Trigger {
       task_id = id.index,
       generation = id.generation,
       schedule = expr,
+      next = ?next,
       "task registered"
     );
     Ok(id)
@@ -253,19 +329,17 @@ impl Trigger {
 
   /// The soonest pending trigger time, if any.
   ///
-  /// Computes each task's next occurrence lazily on first use. The returned
+  /// Each task's first occurrence is computed when it is registered; `None`
+  /// here means no registered task has a future occurrence. The returned
   /// instant may already be in the past if the caller is late; this method
   /// never fires anything and never advances past a pending tick.
   /// [`Trigger::fire_due`] is the only place a run is produced; it skips
   /// stale ticks instead of replaying them.
-  pub fn next(&mut self, now: Timestamp) -> Option<Timestamp> {
+  pub fn next(&self, now: Timestamp) -> Option<Timestamp> {
+    trace!(now = %now, "polling next trigger");
     let mut soonest = None;
-    for slot in &mut self.tasks {
-      let Some(task) = &mut slot.task else { continue };
-      if task.next.is_none() {
-        task.next = task.schedule.next_after(now).map(|zoned| zoned.timestamp());
-        trace!(schedule = &*task.expr, next = ?task.next, "computed next occurrence");
-      }
+    for slot in &self.tasks {
+      let Some(task) = &slot.task else { continue };
       if let Some(at) = task.next {
         soonest = Some(soonest.map_or(at, |soonest: Timestamp| soonest.min(at)));
       }
@@ -290,15 +364,6 @@ impl Trigger {
     for (index, slot) in self.tasks.iter_mut().enumerate() {
       let generation = slot.generation;
       let Some(task) = &mut slot.task else { continue };
-      // Compute the pending instant lazily on first use. A task registered
-      // after `next` ran starts from the dispatch time, so it is never
-      // overdue in this round.
-      if task.next.is_none() {
-        task.next = task
-          .schedule
-          .next_after(started_at)
-          .map(|zoned| zoned.timestamp());
-      }
       let Some(at) = task.next else { continue };
       if at > started_at {
         continue;
@@ -351,10 +416,11 @@ impl Trigger {
         delay = %started_at.duration_since(at),
         "task triggered"
       );
+      let guard = RunningGuard::new(Arc::clone(&task.running));
       let future = (task.callback)(at);
       runs.push(TaskRun {
         id: TaskId { index, generation },
-        running: Arc::clone(&task.running),
+        running: guard.disarm(),
         future,
       });
     }

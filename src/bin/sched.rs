@@ -6,11 +6,16 @@
 //! cargo run --features cli --bin sched -- [--check] [path-to-schedtab]
 //! ```
 //!
-//! Reads a schedtab file and runs each entry's command via bash at its
-//! scheduled times. Logs are written to stdout as structured records; under
-//! systemd, stdout is captured into the journal automatically
-//! (`journalctl -u sched`). Set `SCHEDD_LOG` (or `RUST_LOG`) to control
-//! verbosity, e.g. `SCHEDD_LOG=debug`.
+//! Reads a schedtab file and runs each entry's command via the platform
+//! shell (`bash -c` on Unix, `cmd /C` on Windows) at its scheduled times.
+//! Logs are written to stdout as structured records; under systemd, stdout is
+//! captured into the journal automatically (`journalctl -u sched`). Set
+//! `SCHEDD_LOG` (or `RUST_LOG`) to control verbosity, e.g.
+//! `SCHEDD_LOG=debug`.
+//!
+//! On SIGINT, SIGTERM or SIGHUP (Ctrl-C / console close on Windows) the
+//! daemon stops scheduling new commands and waits for in-flight commands to
+//! finish before exiting.
 //!
 //! Usage: `sched [--check] [path-to-schedtab]`
 //!
@@ -27,17 +32,28 @@
 //! its environment. The command can get its actual execution time itself
 //! (e.g. with `date`), which is the other quantity a scheduled task usually
 //! cares about.
+//!
+//! On Unix, the schedtab must not be writable by group or others; otherwise
+//! an unprivileged user could inject commands into a daemon running as root.
 
 #![forbid(unsafe_code)]
 
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use sched::{Timestamp, Trigger};
+use smol::channel::{Receiver, bounded};
+use smol::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// The platform shell used to run schedtab commands.
+#[cfg(windows)]
+const SHELL: (&str, &str) = ("cmd", "/C");
+#[cfg(not(windows))]
+const SHELL: (&str, &str) = ("bash", "-c");
 
 fn main() -> ExitCode {
   init_logs();
@@ -99,7 +115,12 @@ fn init_logs() {
 /// Reads a schedtab file and registers every valid entry. Returns the
 /// trigger and the number of invalid lines.
 fn load(path: &Path) -> io::Result<(Trigger, usize)> {
-  let contents = std::fs::read_to_string(path)?;
+  // Open first and check the opened handle, so replacing the path between
+  // the permission check and the read cannot bypass it.
+  let mut file = std::fs::File::open(path)?;
+  check_permissions(&file)?;
+  let mut contents = String::new();
+  file.read_to_string(&mut contents)?;
   let mut trigger = Trigger::new();
   let mut errors = 0;
   for (index, raw) in contents.lines().enumerate() {
@@ -129,6 +150,30 @@ fn load(path: &Path) -> io::Result<(Trigger, usize)> {
   Ok((trigger, errors))
 }
 
+/// Rejects a schedtab that group or other users can modify. A daemon running
+/// as root would otherwise execute commands injected by an unprivileged user.
+#[cfg(unix)]
+fn check_permissions(file: &std::fs::File) -> io::Result<()> {
+  use std::os::unix::fs::PermissionsExt;
+
+  let mode = file.metadata()?.permissions().mode();
+  if mode & 0o022 != 0 {
+    return Err(io::Error::new(
+      io::ErrorKind::PermissionDenied,
+      format!(
+        "schedtab is writable by group or others (mode {:03o}); run `chmod go-w`",
+        mode & 0o777
+      ),
+    ));
+  }
+  Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_permissions(_file: &std::fs::File) -> io::Result<()> {
+  Ok(())
+}
+
 /// Splits a schedtab line into schedule expression and command. The first
 /// whitespace run outside braces ends the expression.
 fn split_entry(line: &str) -> Option<(&str, &str)> {
@@ -148,7 +193,8 @@ fn split_entry(line: &str) -> Option<(&str, &str)> {
   None
 }
 
-/// Executes a command via bash, logging its output line by line.
+/// Executes a command via the platform shell, logging its output line by
+/// line as it arrives.
 ///
 /// The nominal trigger time is exposed as `SCHED_SCHEDULED_AT`; the command
 /// can get its actual execution time itself.
@@ -158,49 +204,114 @@ async fn run_command(command: String, scheduled_at: Timestamp) {
     scheduled_at = %scheduled_at,
     "command started"
   );
-  let result = async_process::Command::new("bash")
-    .arg("-c")
+  let child = async_process::Command::new(SHELL.0)
+    .arg(SHELL.1)
     .arg(&command)
     .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
     .env("SCHED_SCHEDULED_AT", scheduled_at.to_string())
-    .output()
-    .await;
-  match result {
-    Ok(output) => {
-      for line in String::from_utf8_lossy(&output.stdout).lines() {
-        info!(command = %command, "{line}");
+    .spawn();
+  let mut child = match child {
+    Ok(child) => child,
+    Err(error) => {
+      warn!(command = %command, %error, "failed to spawn command");
+      return;
+    }
+  };
+  let stdout = child.stdout.take().expect("stdout is piped");
+  let stderr = child.stderr.take().expect("stderr is piped");
+  // Read both pipes concurrently: waiting for the child before draining them
+  // would deadlock once a pipe buffer fills up.
+  let ((), ()) = smol::future::zip(
+    log_lines(stdout, false, &command),
+    log_lines(stderr, true, &command),
+  )
+  .await;
+  match child.status().await {
+    Ok(status) if !status.success() => {
+      warn!(command = %command, status = ?status.code(), "command exited unsuccessfully");
+    }
+    Ok(_) => {}
+    Err(error) => warn!(command = %command, %error, "failed to wait for command"),
+  }
+}
+
+/// Logs one command output stream line by line without buffering the whole
+/// output. Invalid UTF-8 is replaced lossily.
+async fn log_lines<R>(reader: R, stderr: bool, command: &str)
+where
+  R: AsyncRead + Unpin,
+{
+  let mut reader = BufReader::new(reader);
+  let mut buf = Vec::new();
+  loop {
+    buf.clear();
+    match reader.read_until(b'\n', &mut buf).await {
+      Ok(0) => break,
+      Ok(_) => {
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim_end_matches(['\r', '\n']);
+        if stderr {
+          warn!(command = %command, "{line}");
+        } else {
+          info!(command = %command, "{line}");
+        }
       }
-      for line in String::from_utf8_lossy(&output.stderr).lines() {
-        warn!(command = %command, "{line}");
-      }
-      if !output.status.success() {
-        warn!(command = %command, status = ?output.status.code(), "command exited unsuccessfully");
+      Err(error) => {
+        warn!(command = %command, %error, "failed to read command output");
+        break;
       }
     }
-    Err(error) => warn!(command = %command, %error, "failed to spawn command"),
   }
+}
+
+/// Why the scheduler woke up from its sleep.
+enum Wake {
+  Tick,
+  Shutdown,
 }
 
 /// The drive loop: sleep until the soonest trigger time, then spawn every
 /// due run onto the smol executor.
 ///
 /// The dispatch start time is captured exactly once per round and passed to
-/// `fire_due`, so every callback and command sees the same instant.
+/// `fire_due`, so every callback and command sees the same instant. On a
+/// shutdown signal, stop scheduling and wait for in-flight commands.
 async fn drive(mut trigger: Trigger) {
   info!(tasks = trigger.len(), "sched started");
+  let shutdown = shutdown_receiver();
   let mut running: Vec<smol::Task<()>> = Vec::new();
   loop {
     let decision_time = Timestamp::now();
     let Some(scheduled_at) = trigger.next(decision_time) else {
       // No future ticks: let in-flight commands finish before exiting.
-      for task in running {
-        task.await;
-      }
+      wait_for_running(running).await;
       info!("no task will fire again; exiting");
       return;
     };
     if scheduled_at > decision_time {
-      smol::Timer::after(duration_between(decision_time, scheduled_at)).await;
+      let wake = smol::future::or(
+        async {
+          smol::Timer::after(duration_between(decision_time, scheduled_at)).await;
+          Wake::Tick
+        },
+        async {
+          match shutdown.recv().await {
+            Ok(()) => Wake::Shutdown,
+            Err(_) => core::future::pending::<Wake>().await,
+          }
+        },
+      )
+      .await;
+      if matches!(wake, Wake::Shutdown) {
+        info!(
+          running = running.len(),
+          "shutdown requested; waiting for running commands"
+        );
+        wait_for_running(running).await;
+        return;
+      }
     }
     let started_at = Timestamp::now();
     for run in trigger.fire_due(scheduled_at, started_at) {
@@ -208,6 +319,29 @@ async fn drive(mut trigger: Trigger) {
     }
     // Reap completed runs so the handle list does not grow forever.
     running.retain(|task| !task.is_finished());
+  }
+}
+
+/// Installs a Ctrl-C / SIGTERM handler and returns the channel it signals.
+///
+/// If the handler cannot be installed, the sender is dropped and `recv`
+/// returns an error; `drive` then waits only on the timer.
+fn shutdown_receiver() -> Receiver<()> {
+  let (tx, rx) = bounded(1);
+  match ctrlc::set_handler(move || {
+    let _ = tx.try_send(());
+  }) {
+    Ok(()) => {}
+    Err(error) => warn!(%error, "failed to install shutdown signal handler"),
+  }
+  rx
+}
+
+/// Awaits every in-flight command. The service manager can still SIGKILL the
+/// daemon if a command hangs past its stop timeout.
+async fn wait_for_running(running: Vec<smol::Task<()>>) {
+  for task in running {
+    task.await;
   }
 }
 
@@ -239,5 +373,26 @@ mod tests {
     // Missing command.
     assert_eq!(split_entry("{*}-{*}-{*}T08:00:00"), None);
     assert_eq!(split_entry("{*}-{*}-{*}T08:00:00  "), None);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn writable_schedtab_is_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::env::temp_dir().join(format!(
+      "sched-permissions-{}-{}.schedtab",
+      std::process::id(),
+      line!()
+    ));
+    std::fs::write(&path, "").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    assert!(super::check_permissions(&file).is_ok());
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(super::check_permissions(&file).is_err());
+
+    std::fs::remove_file(&path).unwrap();
   }
 }

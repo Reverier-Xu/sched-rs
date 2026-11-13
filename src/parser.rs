@@ -32,33 +32,9 @@ use winnow::token::{any, one_of, take_while};
 use winnow::{ModalResult, Parser};
 
 use crate::error::ParseError;
-use crate::schedule::{FieldSet, FixedOffset, IanaName, MAX_TZ_NAME_LEN, Schedule, ZoneSpec};
-
-/// A schedule field. Used to look up each field's calendrical domain for
-/// `{*}` expansion and for range validation.
-#[derive(Clone, Copy)]
-enum Field {
-  Year,
-  Month,
-  Day,
-  Hour,
-  Minute,
-  Second,
-}
-
-impl Field {
-  /// The field's full calendrical domain, i.e. the values `{*}` expands to
-  /// and the only values an explicit item may contain.
-  fn domain(self) -> (u32, u32) {
-    match self {
-      Self::Year => (1, 9999),
-      Self::Month => (1, 12),
-      Self::Day => (1, 31),
-      Self::Hour => (0, 23),
-      Self::Minute | Self::Second => (0, 59),
-    }
-  }
-}
+use crate::schedule::{
+  Field, FieldSet, FixedOffset, IanaName, MAX_TZ_NAME_LEN, Schedule, ZoneSpec,
+};
 
 fn in_domain(value: u32, domain: (u32, u32)) -> bool {
   (domain.0..=domain.1).contains(&value)

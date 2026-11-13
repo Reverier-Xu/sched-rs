@@ -41,19 +41,21 @@
 //!   Each civil match fires at most once, at its earliest absolute
 //!   occurrence; if that instant is not strictly after the query time, the
 //!   match is skipped. Gaps are skipped.
-//! - `Trigger` is a runtime-agnostic task table: register async callbacks,
-//!   then drive it from any executor — sleep until `Trigger::next`, capture
-//!   the dispatch start time, call `Trigger::fire_due`, and spawn the
-//!   returned `TaskRun` futures. A stale tick is skipped, not replayed; each
-//!   run receives the nominal trigger time, and the callback can call
-//!   `Timestamp::now()` for the actual execution time. A tick whose previous
-//!   run is still in flight is skipped.
+//! - `Trigger` is a runtime-agnostic task table: register async callbacks
+//!   (each task's first occurrence is computed at registration), then drive
+//!   it from any executor — sleep until `Trigger::next`, capture the dispatch
+//!   start time, call `Trigger::fire_due`, and spawn the returned `TaskRun`
+//!   futures. A stale tick is skipped, not replayed; each run receives the
+//!   nominal trigger time, and the callback can call `Timestamp::now()` for
+//!   the actual execution time. A tick whose previous run is still in flight
+//!   is skipped.
 //!
 //! # Feature flags
 //!
-//! - `std` (default): full standard library support.
+//! - `std` (default): full standard library support, including the
+//!   clock-based `Trigger::register`.
 //! - `alloc`: time zone binding and the task trigger in `no_std`
-//!   environments.
+//!   environments; use `Trigger::register_at` to supply the clock.
 //! - `bundle-tzdb`: always use the bundled time zone database.
 //! - `tzdb-platform` (default): use the bundled time zone database only on
 //!   platforms without a system database (e.g. Windows).
