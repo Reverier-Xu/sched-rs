@@ -80,19 +80,19 @@ is skipped. Each task's first occurrence is computed when it is registered.
 
 ## Features
 
-| Feature | Meaning |
-| --- | --- |
-| `std` (default) | Standard library support, including the clock-based `Trigger::register`. |
-| `alloc` | Time zone binding and `Trigger` in `no_std + alloc` environments; use `Trigger::register_at` to supply the clock. |
-| `bundle-tzdb` | Always use the bundled time zone database. |
-| `tzdb-platform` (default) | Use the bundled database only where the platform has none. |
-| `cli` | Build the `sched` daemon binary. Not enabled by default; implies `std` and `tzdb-platform`. |
+| Feature                   | Meaning                                                                                                           |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `std` (default)           | Standard library support, including the clock-based `Trigger::register`.                                          |
+| `alloc`                   | Time zone binding and `Trigger` in `no_std + alloc` environments; use `Trigger::register_at` to supply the clock. |
+| `tzdb-bundled`            | Always use the bundled time zone database.                                                                        |
+| `tzdb-platform` (default) | Use the bundled database only where the platform has none.                                                        |
+| `cli`                     | Build the `sched` daemon binary. Not enabled by default; implies `std` and `tzdb-platform`.                       |
 
 For an embedded `no_std + alloc` target without a system time zone database:
 
 ```toml
 [dependencies]
-sched = { version = "0.1", default-features = false, features = ["bundle-tzdb"] }
+sched = { version = "0.1", default-features = false, features = ["tzdb-bundled"] }
 ```
 
 The civil-only API (`Schedule::next_after`) works with no features at all.

@@ -24,7 +24,7 @@ std = [
   "winnow/std",
 ]
 # Always use the bundled tzdb on all platforms (maps to jiff's tzdb-bundle-always)
-bundle-tzdb = ["alloc", "jiff/tzdb-bundle-always"]
+tzdb-bundled = ["alloc", "jiff/tzdb-bundle-always"]
 # Use the bundled tzdb only on platforms without a system time zone database,
 # e.g. Windows (maps to jiff's tzdb-bundle-platform)
 tzdb-platform = ["alloc", "jiff/tzdb-bundle-platform"]
@@ -42,7 +42,7 @@ cli = [
 [dependencies]
 async-process = { version = "2", optional = true }
 ctrlc = { version = "3", features = ["termination"], optional = true }
-jiff = { version = "0.2", default-features = false, features = [
+jiff = { version = "1.0", default-features = false, features = [
   "tz-fat",
   "perf-inline",
 ] }

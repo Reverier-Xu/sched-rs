@@ -1,7 +1,7 @@
 //! Binding a schedule to a concrete time zone.
 
 use jiff::tz::{AmbiguousOffset, Offset, TimeZone};
-use jiff::{Timestamp, Zoned};
+use jiff::{Timestamp, ZonedDateTime};
 
 use crate::schedule::{IanaName, Schedule, ZoneSpec};
 use crate::search::Cursor;
@@ -74,12 +74,12 @@ impl BoundSchedule {
   /// If that instant is not strictly after `after`, the match is skipped: a
   /// fold's second occurrence is never returned, and a civil time inside a
   /// gap (spring forward) has no occurrence at all.
-  pub fn next_after(&self, after: Timestamp) -> Option<Zoned> {
-    let mut probe = Cursor::start_after(after.to_zoned(self.tz.clone()).datetime())?;
+  pub fn next_after(&self, after: Timestamp) -> Option<ZonedDateTime> {
+    let mut probe = Cursor::start_after(after.to_zoned_datetime(self.tz.clone()).datetime())?;
     loop {
       let candidate = self.schedule.next_civil_from(probe)?;
       let datetime = candidate.to_datetime()?;
-      let ambiguous = self.tz.to_ambiguous_zoned(datetime);
+      let ambiguous = self.tz.to_ambiguous_zoned_datetime(datetime);
       let earliest = match ambiguous.offset() {
         AmbiguousOffset::Unambiguous { .. } => ambiguous.unambiguous().ok(),
         AmbiguousOffset::Fold { .. } => ambiguous.earlier().ok(),

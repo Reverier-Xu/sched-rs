@@ -37,7 +37,8 @@
 //!   works without an allocator. A schedule that declares a time zone is an
 //!   error here — bind it first.
 //! - With `alloc`, `Schedule::bind` resolves the zone declaration into a
-//!   `BoundSchedule`, whose `next_after` returns absolute `Zoned` times.
+//!   `BoundSchedule`, whose `next_after` returns absolute `ZonedDateTime`
+//!   times.
 //!   Each civil match fires at most once, at its earliest absolute
 //!   occurrence; if that instant is not strictly after the query time, the
 //!   match is skipped. Gaps are skipped.
@@ -56,7 +57,7 @@
 //!   clock-based `Trigger::register`.
 //! - `alloc`: time zone binding and the task trigger in `no_std`
 //!   environments; use `Trigger::register_at` to supply the clock.
-//! - `bundle-tzdb`: always use the bundled time zone database.
+//! - `tzdb-bundled`: always use the bundled time zone database.
 //! - `tzdb-platform` (default): use the bundled time zone database only on
 //!   platforms without a system database (e.g. Windows).
 //! - `cli`: build the `sched` daemon binary (non-default; implies `std` and
@@ -85,7 +86,7 @@ pub use schedule::{FieldSet, FixedOffset, IanaName, Schedule, ZoneSpec};
 #[cfg(feature = "alloc")]
 pub use bind::{BindError, BoundSchedule};
 #[cfg(feature = "alloc")]
-pub use jiff::Zoned;
+pub use jiff::ZonedDateTime;
 #[cfg(feature = "alloc")]
 pub use trigger::{RegisterError, TaskId, TaskRun, Trigger};
 
